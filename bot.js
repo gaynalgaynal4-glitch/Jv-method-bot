@@ -156,6 +156,17 @@ bot.action(/^method:(.+)$/, async (ctx) => {
     return ctx.editMessageText("⚠️ I don't have your video anymore — please send it again.");
   }
 
+  // ffm-page needs a target-FPS choice before processing starts.
+  if (key === 'ffmpage') {
+    return ctx.editMessageText(
+      '🎞️ Select your target FPS:',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('30 FPS', 'ffmpage:fps:30')],
+        [Markup.button.callback('60 FPS', 'ffmpage:fps:60')],
+      ])
+    );
+  }
+
   await ctx.editMessageText(`⚙️ Processing with ${info.label}…`);
 
   const inputPath  = pending.inputPath;
@@ -199,6 +210,60 @@ bot.action(/^method:(.+)$/, async (ctx) => {
 
   try { await ctx.deleteMessage(); } catch (_) {}
   pendingVideos.delete(userId);
+});
+
+// ffm-page target FPS selection. The method detects source FPS and computes
+// sourceFPS / targetFPS automatically, then remuxes with -itsscale and -c copy.
+bot.action(/^ffmpage:fps:(30|60)$/, async (ctx) => {
+  const targetFps = Number(ctx.match[1]);
+  await ctx.answerCbQuery();
+
+  const userId = ctx.from.id;
+  const pending = pendingVideos.get(userId);
+  if (!pending || !fs.existsSync(pending.inputPath)) {
+    return ctx.editMessageText("⚠️ I don't have your video anymore — please send it again.");
+  }
+
+  await ctx.editMessageText(`⚙️ Detecting source FPS and applying ${targetFps} FPS timestamp scaling…`);
+
+  const inputPath = pending.inputPath;
+  const outputPath = path.join(
+    path.dirname(inputPath),
+    `out_ffmpage_${crypto.randomBytes(4).toString('hex')}${path.extname(inputPath) || '.mp4'}`
+  );
+
+  try {
+    const mod = loadMethod('ffmpage');
+    const result = await mod.process(inputPath, outputPath, { targetFps });
+
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+      throw new Error('FFmpeg did not produce a valid output file.');
+    }
+
+    await ctx.editMessageText('📤 Uploading your processed video…');
+    const caption = [
+      '✅ ffm-page method completed',
+      `Source: ${result.sourceFps.toFixed(3)} FPS`,
+      `Target selection: ${targetFps} FPS`,
+      `Timestamp scale: ${result.scaleFactor.toFixed(4)}x`,
+      'Mode: stream copy (no re-encoding)',
+    ].join('\n');
+
+    await ctx.telegram.sendVideo(
+      ctx.chat.id,
+      { source: fs.createReadStream(outputPath) },
+      { caption }
+    );
+
+    try { await ctx.deleteMessage(); } catch (_) {}
+    pendingVideos.delete(userId);
+  } catch (err) {
+    console.error('ffm-page processing error:', err);
+    await ctx.editMessageText(`❌ ffm-page processing failed: ${err.message}`);
+  } finally {
+    fs.unlink(outputPath, () => {});
+    // Keep the source available after an error so the user can retry another method.
+  }
 });
 
 bot.catch((err, ctx) => {
