@@ -122,10 +122,55 @@ async function telegramDownload(ctx, file, userId) {
   await downloadToFile(link.href, inputPath);
   return inputPath;
 }
+function isTransientTelegramUploadError(err) {
+  const message = String(err && (err.message || err) || '').toLowerCase();
+  return /socket hang up|econnreset|etimedout|econnrefused|ehostunreach|enotfound|network error|fetch failed|request timeout|timed out|aborted/.test(message);
+}
+
+function makeUploadSource(filePath) {
+  // Always create a fresh stream for every attempt. A consumed/destroyed stream
+  // cannot be safely reused after a network interruption.
+  return { source: fs.createReadStream(filePath), filename: safeName(path.basename(filePath)) };
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function sendVideoFile(ctx, filePath, caption) {
   const size = fs.statSync(filePath).size;
-  if (size > 49 * 1024 * 1024) throw new Error('Output is larger than Telegram bot video upload limit.');
-  await ctx.telegram.sendVideo(ctx.chat.id, { source: fs.createReadStream(filePath), filename: safeName(path.basename(filePath)) }, { caption: String(caption || '').slice(0, 900) });
+  if (!size) throw new Error('The processed output file is empty.');
+  if (size > 49 * 1024 * 1024) {
+    throw new Error(`Processed video is ${(size / 1048576).toFixed(1)} MB, above this bot's 49 MB upload safety limit.`);
+  }
+
+  const options = { caption: String(caption || '').slice(0, 900), supports_streaming: true };
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const source = makeUploadSource(filePath);
+    try {
+      await ctx.telegram.sendVideo(ctx.chat.id, source, options);
+      return { sentAs: 'video', attempts: attempt };
+    } catch (err) {
+      lastError = err;
+      if (source.source && !source.source.destroyed) source.source.destroy();
+      if (!isTransientTelegramUploadError(err) || attempt === 3) break;
+      console.warn(`[telegram] sendVideo attempt ${attempt}/3 failed; retrying:`, err.message);
+      await sleep(attempt * 2000);
+    }
+  }
+
+  // If Telegram's video endpoint repeatedly drops the connection, try one
+  // document upload as a delivery fallback. The MP4 remains unchanged.
+  if (lastError && isTransientTelegramUploadError(lastError)) {
+    const source = makeUploadSource(filePath);
+    try {
+      await ctx.telegram.sendDocument(ctx.chat.id, source, { caption: options.caption });
+      return { sentAs: 'document_fallback', attempts: 4 };
+    } catch (fallbackError) {
+      if (source.source && !source.source.destroyed) source.source.destroy();
+      throw new Error(`Telegram could not receive the processed video after 3 video attempts and a document fallback. Last video error: ${lastError.message}. Document fallback error: ${fallbackError.message}`);
+    }
+  }
+  throw new Error(`Telegram video upload failed: ${lastError ? lastError.message : 'unknown upload error'}`);
 }
 
 // Kuronai upload protocol copied from inject.js:
@@ -217,11 +262,15 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     await kuronaiDownload(fileId, outputPath, (percent) => {
       editProgress(ctx, status.message_id, `⬇️ ${title}\nDownloading result: ${percent}%\nElapsed: ${fmtTime(Date.now() - started)}`).catch(() => {});
     });
-    await editProgress(ctx, status.message_id, '📤 Sending processed video to Telegram…', true);
-    await sendVideoFile(ctx, outputPath, `✅ ${title} complete\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON — re-encode requested' : 'OFF — re-encode disabled')}`);
+    await editProgress(ctx, status.message_id, '📤 Sending processed video to Telegram…\nLarge files may take a little while. Automatic retry is enabled.', true);
+    const delivery = await sendVideoFile(ctx, outputPath, `✅ ${title} complete\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON — re-encode requested' : 'OFF — re-encode disabled')}`);
     await fs.promises.unlink(outputPath).catch(() => {});
-    await editProgress(ctx, status.message_id, `✅ ${title} completed\nElapsed: ${fmtTime(Date.now() - started)}`, true);
+    const deliveryNote = delivery.sentAs === 'document_fallback' ? '\nDelivered as an MP4 document after Telegram video upload retries.' : '';
+    await editProgress(ctx, status.message_id, `✅ ${title} completed\nElapsed: ${fmtTime(Date.now() - started)}${deliveryNote}`, true);
     pendingVideos.delete(ctx.from.id);
+  } catch (err) {
+    await editProgress(ctx, status.message_id, `❌ ${title} delivery failed\n${String(err.message || err).slice(0, 1200)}\n\nYour original video is still available. Please try again later.`, true);
+    throw err;
   } finally {
     clearInterval(timer);
     if (fileId) await kuronaiCleanup(fileId);
@@ -340,7 +389,11 @@ async function withBusy(ctx, fn) {
   const id = ctx.from.id;
   if (busyUsers.has(id)) { await ctx.reply('⏳ You already have a processing task running.'); return; }
   busyUsers.add(id);
-  try { await fn(); } catch (err) { console.error(err); await ctx.reply(`❌ ${err.message || 'Operation failed.'}`).catch(() => {}); }
+  try { await fn(); } catch (err) {
+    ctx.__errorReported = true;
+    console.error('[task] Operation failed:', err);
+    await ctx.reply(`❌ ${err.message || 'Operation failed.'}`).catch(() => {});
+  }
   finally { busyUsers.delete(id); }
 }
 bot.action('method:enhanced', async (ctx) => {
@@ -506,7 +559,10 @@ bot.on('text', async (ctx) => {
   if (validTikTokUrl(text)) return processTikTokUrl(ctx, text);
 });
 
-bot.catch((err, ctx) => { console.error('Bot error:', err); if (ctx) ctx.reply('❌ Something went wrong. Please try again.').catch(() => {}); });
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  if (ctx && !ctx.__errorReported) ctx.reply('❌ Something went wrong. Please try again.').catch(() => {});
+});
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
