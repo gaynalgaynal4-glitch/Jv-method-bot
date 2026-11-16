@@ -16,6 +16,10 @@ const WEBHOOK_PATH = `/webhook/${process.env.WEBHOOK_SECRET || 'jv-bot'}`;
 const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
+// Required-channel gate. The bot must be an administrator in this channel
+// so Telegram can reliably return membership status for other users.
+const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || '@jv_60fps';
+const REQUIRED_CHANNEL_URL = process.env.REQUIRED_CHANNEL_URL || 'https://t.me/jv_60fps';
 const KURONAI_API = 'https://api.kuronaiapp.com';
 const TIKWM_API = 'https://www.tikwm.com/api/';
 const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
@@ -31,6 +35,41 @@ fs.mkdirSync(WORK_DIR, { recursive: true });
 const bot = new Telegraf(BOT_TOKEN);
 const pendingVideos = new Map();
 const busyUsers = new Set();
+
+// Check membership on every interaction. The explicit check button bypasses
+// this middleware so users can re-check after joining.
+bot.use(async (ctx, next) => {
+  if (!ctx.from || (ctx.callbackQuery && ctx.callbackQuery.data === 'membership:check')) {
+    return next();
+  }
+  try {
+    const member = await ctx.telegram.getChatMember(REQUIRED_CHANNEL, ctx.from.id);
+    const isMember = ['creator', 'administrator', 'member'].includes(member.status)
+      || (member.status === 'restricted' && member.is_member === true);
+    if (isMember) return next();
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.url('📢 Join JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+      [Markup.button.callback('✅ I Joined — Check Again', 'membership:check')],
+    ]);
+    const message = '🔒 Channel Membership Required\\n\\nPlease join our channel first to use this bot. After joining, tap “I Joined — Check Again”.';
+    if (ctx.callbackQuery) {
+      await ctx.answerCbQuery('Please join the required channel first.', { show_alert: true }).catch(() => {});
+      await ctx.reply(message, keyboard).catch(() => {});
+    } else {
+      await ctx.reply(message, keyboard).catch(() => {});
+    }
+  } catch (err) {
+    console.error('[membership] Could not verify channel membership:', err.message);
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.url('📢 Open JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+      [Markup.button.callback('🔄 Try Again', 'membership:check')],
+    ]);
+    await ctx.reply(
+      '⚠️ I could not verify your channel membership. Please try again in a moment. If this keeps happening, the bot administrator must add this bot as an administrator to @jv_60fps.',
+      keyboard
+    ).catch(() => {});
+  }
+});
 const METHODS = {
   enhanced: { label: '🟢 Enhanced Method', route: '/uploaden/' },
   luna: { label: '🌙 Luna (MP4Patcher)' },
@@ -241,6 +280,25 @@ function ffmpegKeyboard() {
     [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
+
+bot.action('membership:check', async (ctx) => {
+  await ctx.answerCbQuery('Checking your membership…').catch(() => {});
+  try {
+    const member = await ctx.telegram.getChatMember(REQUIRED_CHANNEL, ctx.from.id);
+    const isMember = ['creator', 'administrator', 'member'].includes(member.status)
+      || (member.status === 'restricted' && member.is_member === true);
+    if (!isMember) {
+      return ctx.reply('❌ You have not joined @jv_60fps yet. Join the channel, then tap the check button again.', Markup.inlineKeyboard([
+        [Markup.button.url('📢 Join JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+        [Markup.button.callback('✅ Check Again', 'membership:check')],
+      ]));
+    }
+    return ctx.reply('✅ Membership verified! You can now use JV Methods Bot.', mainKeyboard());
+  } catch (err) {
+    console.error('[membership] Recheck failed:', err.message);
+    return ctx.reply('⚠️ Could not verify membership. Please try again later. The bot must be an administrator in @jv_60fps.');
+  }
+});
 
 bot.start((ctx) => ctx.reply('👋 JV Methods Bot\n\nSend a video to process it, or use Checker & Downloader to inspect a public TikTok URL.', mainKeyboard()));
 bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis), or FFmpeg. For TikTok links choose Checker & Downloader.'));
