@@ -1,84 +1,65 @@
-'use strict';
-
-const fs = require('fs');
-const path = require('path');
 const { TelegramClient } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 
 let client;
-let startPromise;
+let connecting;
 
-function requiredEnv(name) {
+function required(name) {
   const value = process.env[name];
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  if (!value) throw new Error(`Missing required environment variable ${name}.`);
   return value;
 }
 
-async function start() {
+async function startTelegramTransfer() {
   if (client && client.connected) return client;
-  if (startPromise) return startPromise;
-  startPromise = (async () => {
-    const apiId = Number(requiredEnv('API_ID'));
-    const apiHash = requiredEnv('API_HASH');
-    const botToken = requiredEnv('BOT_TOKEN');
-    if (!Number.isInteger(apiId) || apiId <= 0) throw new Error('API_ID must be a positive integer.');
-    // A fresh in-memory StringSession is intentionally used. GramJS authenticates
-    // the bot again with BOT_TOKEN after a cold start; no session file is needed.
+  if (connecting) return connecting;
+  connecting = (async () => {
+    const apiId = Number(required('API_ID'));
+    const apiHash = required('API_HASH');
+    const botToken = required('BOT_TOKEN');
+    if (!Number.isInteger(apiId) || apiId <= 0) throw new Error('API_ID must be a valid numeric Telegram API ID.');
     client = new TelegramClient(new StringSession(''), apiId, apiHash, {
       connectionRetries: 5,
-      autoReconnect: true,
       requestRetries: 5,
-      useWSS: false
+      autoReconnect: true,
     });
     await client.start({ botAuthToken: botToken });
-    // Telegraf owns all bot text/command UI; MTProto captions are sent as plain text.
-    client.setParseMode(undefined);
+    console.log('[mtproto] Telegram media transfer connected.');
     return client;
   })();
-  try { return await startPromise; }
-  catch (error) { client = undefined; throw error; }
-  finally { startPromise = undefined; }
+  try { return await connecting; }
+  finally { connecting = null; }
 }
 
-async function downloadMessageMedia(chatId, messageId, destination, onProgress) {
-  const tg = await start();
+async function downloadTelegramMessage(chatId, messageId, destination) {
+  const tg = await startTelegramTransfer();
   const messages = await tg.getMessages(chatId, { ids: [Number(messageId)] });
   const message = messages && messages[0];
-  if (!message || !message.media) throw new Error('Telegram could not find the original video message.');
-  await tg.downloadMedia(message, {
-    outputFile: destination,
-    progressCallback: (received, total) => {
-      if (onProgress) onProgress(Number(received) || 0, Number(total) || 0);
-    }
-  });
-  if (!fs.existsSync(destination) || fs.statSync(destination).size === 0) {
-    throw new Error('Telegram returned an empty media file.');
-  }
-  return destination;
+  if (!message || !message.media) throw new Error('Telegram could not find media in the original message.');
+  await tg.downloadMedia(message, { outputFile: destination });
+  const fs = require('fs');
+  const stat = await fs.promises.stat(destination).catch(() => null);
+  if (!stat || !stat.size) throw new Error('Telegram media download produced an empty file.');
+  return stat.size;
 }
 
-async function uploadVideo(chatId, filePath, caption, onProgress, topMsgId) {
-  const tg = await start();
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile() || stat.size <= 0) throw new Error('The output video is empty or missing.');
-  return tg.sendFile(chatId, {
-    file: path.resolve(filePath),
+async function uploadTelegramVideo(chatId, filePath, caption, replyToMessageId) {
+  const tg = await startTelegramTransfer();
+  const params = {
+    file: filePath,
     caption: String(caption || '').slice(0, 900),
     forceDocument: false,
-    supportsStreaming: path.extname(filePath).toLowerCase() === '.mp4',
     workers: 1,
-    topMsgId: Number.isInteger(Number(topMsgId)) && Number(topMsgId) > 0 ? Number(topMsgId) : undefined,
-    progressCallback: onProgress
-      ? (fraction) => onProgress(Math.max(0, Math.min(1, Number(fraction) || 0)), 1)
-      : undefined
-  });
+  };
+  if (replyToMessageId) params.replyTo = Number(replyToMessageId);
+  return tg.sendFile(chatId, params);
 }
 
-async function shutdown() {
-  if (!client) return;
-  const current = client;
-  client = undefined;
-  try { await current.disconnect(); } catch (_) {}
+async function stopTelegramTransfer() {
+  if (client) {
+    try { await client.disconnect(); } catch (_) {}
+    client = null;
+  }
 }
 
-module.exports = { start, downloadMessageMedia, uploadVideo, shutdown };
+module.exports = { startTelegramTransfer, downloadTelegramMessage, uploadTelegramVideo, stopTelegramTransfer };

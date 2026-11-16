@@ -1,58 +1,38 @@
 # JV Methods Bot v2.1
 
-A Telegraf webhook bot with a separate GramJS MTProto media-transfer client. Existing processing methods and the TikTok checker UI are retained.
+Telegram video processing bot using MTProto for Telegram media downloads and uploads.
 
-## Features
+## Features retained
+- **Enhanced Method** — Kuronai `/uploaden/`.
+- **HD Method**
+  - **Luna (MP4Patcher)** — original local MP4 patcher adapter.
+  - **Jarvis HQ** — Kuronai `/upload/`, with Optimizer ON/OFF.
+- **FFmpeg Method** — original timestamp-scaling workflow with 30 FPS or 60 FPS selection.
+- Video and video-document uploads are accepted.
 
-- `/start` and `/help`, existing inline menus and callbacks.
-- Enhanced Method using Kuronai `/uploaden/`.
-- Luna using the original `methods/c_method.js` MP4Patcher adapter.
-- Jarvis HQ using Kuronai `/upload/`, preserving optimizer ON/OFF.
-- FFmpeg method using the original timestamp-scaling implementation and 30/60 FPS options.
-- TikTok Checker & Downloader using server-side `yt-dlp`; TikWM is not used.
-- One configurable maximum video size, defaulting to 200 MB, checked on incoming media, processing inputs/outputs, TikTok downloads, Kuronai outputs and Telegram uploads.
-- GramJS MTProto media transfer for incoming message downloads and outgoing video uploads. Telegraf remains responsible for commands, callbacks, webhook updates and the health endpoint.
+The TikTok checker/downloader and all TikTok URL handling have been removed.
 
-## Render deployment (recommended: Docker)
+## Deploy on Render (Node Web Service)
+1. Upload this project to your GitHub repository.
+2. Create or update a Render **Web Service** using the repository.
+3. Runtime: Node. Build command: `npm install`. Start command: `npm start`.
+4. Set these environment variables:
+   - `BOT_TOKEN` — token from BotFather.
+   - `API_ID` and `API_HASH` — obtain them from https://my.telegram.org.
+   - `RENDER_EXTERNAL_URL` — Render normally provides this automatically.
+   - `WEBHOOK_SECRET` — long random string.
+   - `MAX_VIDEO_MB` — optional, defaults to 200.
+5. Deploy. Startup logs should include `[mtproto] Telegram media transfer connected.` and `[bot] Webhook registered.`
 
-Create a Render **Web Service** connected to the repository.
+## MTProto notes
+- Uses GramJS bot authorization with the same `BOT_TOKEN`, plus `API_ID` and `API_HASH`.
+- Telegram media is downloaded by retrieving the original message with MTProto and writing it to a temporary file.
+- Processed videos are uploaded through MTProto, including files larger than the ordinary Bot API video-upload limit, subject to Telegram's current account/API limits.
+- No user session string is required or stored.
+- Do not expose `.env` or credentials in Git.
 
-- **Runtime:** Docker
-- **Root Directory:** the directory containing this Dockerfile (repository root if the project files are at the root)
-- **Build Command:** leave blank; Render builds the Dockerfile
-- **Start Command:** leave blank; Dockerfile runs `npm start`
-- **Health Check Path:** `/`
-- **Environment:** add the variables below in Render's Environment page
-
-Required variables:
-
-- `BOT_TOKEN` — bot token from BotFather
-- `API_ID` — Telegram API ID
-- `API_HASH` — Telegram API hash
-- `MAX_VIDEO_MB` — `200` (optional; 200 is the default)
-- `WEBHOOK_SECRET` — long random secret used in the webhook URL path
-- `RENDER_EXTERNAL_URL` — Render service public URL if not automatically supplied
-- `YTDLP_PATH` — `/opt/yt-dlp-venv/bin/yt-dlp` (already set in the Docker image)
-
-Render supplies `PORT` automatically. Do not set a fixed production port unless you have a specific reason. The service listens on `process.env.PORT`.
-
-The Docker image installs Python 3, a virtual environment, FFmpeg, FFprobe and yt-dlp once. Node dependencies are installed once; there is no Python `postinstall` in `package.json`. `.dockerignore` excludes `.env` from the Docker build context.
-
-## Telegram MTProto transfer
-
-GramJS authenticates as the bot account with `API_ID`, `API_HASH` and `BOT_TOKEN`. It fetches the exact message media by chat ID and message ID and writes it to disk, then sends outputs with `sendFile`. The session is held in memory and can be recreated at startup using the bot token, so no local session file is required across Render redeploys.
-
-The configured 200 MB limit is below Telegram's MTProto large-file upload capability. This does not change the Bot API's ordinary file limits: the code deliberately uses MTProto for the media transfer path. Telegram's server-side limits and account/API policy can still change, so a successful transfer must be confirmed in the deployed bot.
-
-## Security
-
-- Never commit `.env`; it is excluded by `.gitignore` and `.dockerignore`.
-- `.env.example` contains variable names and placeholders only.
-- GitHub does not automatically transfer a repository's local `.env` values into Render. Add each secret as a Render Environment Variable.
-- If the supplied `.env` was committed to a public/shared GitHub repository, revoke/rotate the BotFather token immediately, create replacement Telegram API credentials if the exposed application credentials can be replaced, remove `.env` from Git tracking/history, and redeploy with new Render variables. An API hash should be treated as compromised if exposed.
-
-## Notes and limitations
-
-- TikTok extraction depends on TikTok's availability to the server IP and may fail for region-restricted videos or URLs requiring cookies. The error message retains yt-dlp details.
-- The Luna MP4Patcher implementation operates on a complete MP4 byte array; unlike the Kuronai and download/upload paths, that existing algorithm is inherently memory-intensive. It was retained to avoid changing the user's processing algorithm.
-- A full Telegram transfer test requires valid live `BOT_TOKEN`, `API_ID` and `API_HASH` values and an actual Telegram chat. These credentials are not included in this project archive.
+## Validation and limitations
+- `npm run check` validates JavaScript syntax for the bot and retained processing modules.
+- This is not a live integration test. Real Telegram MTProto authentication, Kuronai API behavior, and FFmpeg processing must be verified after deployment with your credentials and a test video.
+- Luna's original MP4Patcher reads the entire MP4 into memory. Large files can therefore use substantial RAM.
+- The FFmpeg method copies streams and changes timestamps; it does not re-encode the video.
