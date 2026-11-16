@@ -17,7 +17,8 @@ const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
 const KURONAI_API = 'https://api.kuronaiapp.com';
-const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
+const PROJECT_YTDLP = path.join(__dirname, '.venv', 'bin', 'yt-dlp');
+const YTDLP = process.env.YTDLP_PATH || (fs.existsSync(PROJECT_YTDLP) ? PROJECT_YTDLP : 'yt-dlp');
 const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
 const FFPROBE_PKG = require('ffprobe-static');
 const FFPROBE = process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
@@ -309,16 +310,44 @@ function validTikTokUrl(value) {
 }
 function pick(...values) { return values.find(v => v !== undefined && v !== null && v !== ''); }
 function prettyNum(v) { return v == null ? 'Unavailable' : Number(v).toLocaleString('en-US'); }
-function runYtDlp(args, timeout = 20 * 60 * 1000) {
+function execYtDlp(command, commandArgs, timeout) {
   return new Promise((resolve, reject) => {
-    execFile(YTDLP, args, { timeout, maxBuffer: 24 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
-      if (err) {
-        const detail = String(stderr || err.message || 'yt-dlp failed').trim().split('\n').slice(-5).join('\n');
-        return reject(new Error(detail.slice(-1600)));
-      }
+    execFile(command, commandArgs, {
+      timeout,
+      maxBuffer: 24 * 1024 * 1024,
+      windowsHide: true,
+      env: process.env,
+    }, (err, stdout, stderr) => {
+      if (err) return reject(Object.assign(err, {
+        ytDlpDetail: String(stderr || err.message || 'yt-dlp failed').trim().split('\\n').slice(-5).join('\\n').slice(-1600)
+      }));
       resolve({ stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() });
     });
   });
+}
+
+async function runYtDlp(args, timeout = 20 * 60 * 1000) {
+  // Prefer the configured/native executable. On Render's native Node runtime,
+  // fall back to the Python module installed in the project's virtualenv/system Python.
+  try {
+    return await execYtDlp(YTDLP, args, timeout);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      throw new Error(err.ytDlpDetail || err.message || 'yt-dlp failed');
+    }
+    const python = process.env.PYTHON_PATH || 'python3';
+    try {
+      return await execYtDlp(python, ['-m', 'yt_dlp', ...args], timeout);
+    } catch (pythonErr) {
+      const detail = pythonErr.ytDlpDetail || pythonErr.message || 'Python yt-dlp module could not be started.';
+      if (pythonErr.code === 'ENOENT') {
+        throw new Error(
+          `yt-dlp is not installed or not found. On Render, create a Python virtualenv and install yt-dlp, then set YTDLP_PATH to its executable. Original error: ${err.message}`
+        );
+      }
+      throw new Error(detail);
+    }
+  }
 }
 async function ytDlpInfo(url) {
   const { stdout } = await runYtDlp(['--dump-single-json', '--no-warnings', '--no-playlist', '--no-call-home', '--retries', '2', '--extractor-retries', '2', url], 180000);
