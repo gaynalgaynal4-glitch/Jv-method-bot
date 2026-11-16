@@ -17,7 +17,7 @@ const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
 const KURONAI_API = 'https://api.kuronaiapp.com';
-const TIKWM_API = 'https://www.tikwm.com/api/';
+const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
 const FFPROBE_PKG = require('ffprobe-static');
 const FFPROBE = process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
@@ -242,14 +242,14 @@ function ffmpegKeyboard() {
   ]);
 }
 
-bot.start((ctx) => ctx.reply('👋 JV Methods Bot\n\nSend a video to process it, or use Checker & Downloader to inspect a public TikTok URL.', mainKeyboard()));
+bot.start((ctx) => ctx.reply('👋 Welcome to JV-60FPS\n\n📖 How to use:\n• Send a video to see processing methods.\n• Send a TikTok URL to automatically check its details and download options.\n\nNo method menu is shown until you send media.'));
 bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis), or FFmpeg. For TikTok links choose Checker & Downloader.'));
 
 bot.on(['video', 'document'], async (ctx) => {
   const file = ctx.message.video || ctx.message.document;
   if (!file || (ctx.message.document && !(file.mime_type || '').startsWith('video/'))) return;
   const sizeMB = (file.file_size || 0) / 1048576;
-  if (sizeMB > MAX_VIDEO_MB) return ctx.reply(`⚠️ Video is ${sizeMB.toFixed(1)} MB. Maximum is ${MAX_VIDEO_MB} MB.`);
+  if (file.file_size && sizeMB > MAX_VIDEO_MB) return ctx.reply(`⚠️ Video is ${sizeMB.toFixed(1)} MB. Current configured limit is ${MAX_VIDEO_MB} MB.`);
   const status = await ctx.reply('📥 Downloading your video…');
   try {
     const inputPath = await telegramDownload(ctx, file, ctx.from.id);
@@ -267,7 +267,7 @@ bot.action('menu:ffmpeg', async (ctx) => { await ctx.answerCbQuery(); return ctx
 bot.action('menu:checker', async (ctx) => {
   await ctx.answerCbQuery();
   pendingVideos.set(ctx.from.id, { ...(pendingVideos.get(ctx.from.id) || {}), awaitingTikTokUrl: true });
-  return ctx.reply('🔎 Checker & Downloader\nSend a public TikTok video URL. I will retrieve available region, creator, video metadata, standard download and original/highest-quality download links.');
+  return ctx.reply('🔎 Checker & Downloader\nSend a public TikTok video URL. The JV server will extract available creator, region, video metadata and quality options using yt-dlp.');
 });
 
 async function getPending(ctx) {
@@ -302,43 +302,51 @@ bot.action(/^ffmpeg:fps:(30|60)$/, async (ctx) => {
   return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runLocalMethod(ctx, p, 'ffmpeg', { targetFps: fps }); });
 });
 
-// TikWM checker flow adapted from the supplied HTML. The HTML exposes region,
-// metadata and download URLs; it does not expose browser/phone playback probing or a country-ban reason.
+// TikTok checker/downloader powered by a self-hosted yt-dlp binary.
+// No TikWM API calls or third-party paid API are used.
 function validTikTokUrl(value) {
   try { const u = new URL(value); return /(^|\.)tiktok\.com$/i.test(u.hostname); } catch (_) { return false; }
 }
 function pick(...values) { return values.find(v => v !== undefined && v !== null && v !== ''); }
 function prettyNum(v) { return v == null ? 'Unavailable' : Number(v).toLocaleString('en-US'); }
-async function tikwmCheck(url) {
-  const response = await fetch(TIKWM_API + '?url=' + encodeURIComponent(url), { headers: { Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`TikWM returned HTTP ${response.status}`);
-  const payload = await response.json();
-  if (payload.code !== 0 || !payload.data) throw new Error(payload.msg || 'TikTok video could not be retrieved.');
-  return payload.data;
-}
-async function tikwmOriginal(url) {
-  const submit = await fetch('https://www.tikwm.com/api/video/task/submit', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://www.tikwm.com/originalDownloader.html' },
-    body: 'url=' + encodeURIComponent(url) + '&web=1'
+function runYtDlp(args, timeout = 20 * 60 * 1000) {
+  return new Promise((resolve, reject) => {
+    execFile(YTDLP, args, { timeout, maxBuffer: 24 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String(stderr || err.message || 'yt-dlp failed').trim().split('\n').slice(-5).join('\n');
+        return reject(new Error(detail.slice(-1600)));
+      }
+      resolve({ stdout: String(stdout || '').trim(), stderr: String(stderr || '').trim() });
+    });
   });
-  if (!submit.ok) throw new Error(`Original downloader returned HTTP ${submit.status}`);
-  const payload = await submit.json();
-  const taskId = payload && payload.data && payload.data.task_id;
-  if (payload.code !== 0 || !taskId) throw new Error(payload.msg || 'Could not start original-quality task.');
-  for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    const response = await fetch('https://www.tikwm.com/api/video/task/result?task_id=' + encodeURIComponent(taskId));
-    if (!response.ok) continue;
-    const result = await response.json();
-    if (result.code === 0 && result.data) {
-      const d = result.data.detail || result.data;
-      const link = d.play_url || d.download_url || d.play;
-      if (link) return link;
-      if (['failed', 'error'].includes(result.data.status)) throw new Error('Provider could not create the original file.');
-    }
-  }
-  throw new Error('Original-quality link was not returned in time.');
+}
+async function ytDlpInfo(url) {
+  const { stdout } = await runYtDlp(['--dump-single-json', '--no-warnings', '--no-playlist', '--no-call-home', '--retries', '2', '--extractor-retries', '2', url], 180000);
+  let data;
+  try { data = JSON.parse(stdout); } catch (_) { throw new Error('yt-dlp returned invalid metadata JSON.'); }
+  if (!data || !data.id) throw new Error('yt-dlp could not identify this TikTok video.');
+  return data;
+}
+function formatSummary(info) {
+  const formats = (info.formats || []).filter(f => f && (f.vcodec && f.vcodec !== 'none'));
+  const heights = [...new Set(formats.map(f => Number(f.height)).filter(n => Number.isFinite(n) && n > 0))].sort((a,b) => b-a);
+  return heights.length ? heights.slice(0, 8).map(h => `${h}p`).join(', ') : 'Not reported by extractor';
+}
+async function ytDlpDownload(url, quality, userId) {
+  const base = tempPath(userId, quality === 'best' ? 'tiktok_best' : 'tiktok_standard', '');
+  const outputTemplate = `${base}.%(ext)s`;
+  const selector = quality === 'best'
+    ? 'bestvideo*+bestaudio/best'
+    : 'best[height<=720]/best';
+  const { stdout } = await runYtDlp([
+    '--no-warnings', '--no-playlist', '--no-part', '--no-call-home',
+    '--retries', '3', '--fragment-retries', '3',
+    '-f', selector, '--merge-output-format', 'mp4',
+    '-o', outputTemplate, '--print', 'after_move:filepath', url
+  ], 30 * 60 * 1000);
+  const outputPath = stdout.split(/\r?\n/).map(x => x.trim()).filter(Boolean).pop();
+  if (!outputPath || !fs.existsSync(outputPath)) throw new Error('yt-dlp finished but did not produce an output file.');
+  return outputPath;
 }
 async function inspectMedia(filePath) {
   return new Promise((resolve, reject) => {
@@ -354,86 +362,83 @@ function fpsValue(value) {
   return Number.isFinite(n) ? n.toFixed(3) : 'Unavailable';
 }
 async function processTikTokUrl(ctx, url) {
-  const status = await ctx.reply('🔎 Checking TikTok URL…');
+  const status = await ctx.reply('🔎 Extracting TikTok details from the server with yt-dlp…');
   try {
-    const d = await tikwmCheck(url);
-    const video = d.video || {};
-    const author = d.author || {};
-    const stats = d.statistics || d.stats || {};
-    const region = pick(d.region, d.region_code, d.created_region, 'Not provided by TikWM');
-    const standard = d.play || d.wmplay || d.hdplay || null;
-    const hd = d.hdplay || null;
+    const d = await ytDlpInfo(url);
+    const formats = formatSummary(d);
+    const region = pick(d.region, d.country, d.location, 'Not provided by TikTok extractor');
     const info = [
       '✅ TIKTOK VIDEO FOUND',
       `Title: ${pick(d.title, 'TikTok video')}`,
-      `Creator: @${pick(author.unique_id, author.username, 'unknown')}`,
-      `Region/Country code: ${region}`,
-      `Video ID: ${pick(d.id, d.aweme_id, d.video_id, 'Unavailable')}`,
+      `Creator: @${pick(d.uploader_id, d.channel_id, d.uploader, 'unknown')}`,
+      `Uploader: ${pick(d.uploader, d.channel, 'Unavailable')}`,
+      `Region/Country: ${region}`,
+      `Video ID: ${pick(d.id, 'Unavailable')}`,
       '', '📊 STATISTICS',
-      `Views: ${prettyNum(pick(d.play_count, stats.play_count, stats.view_count))}`,
-      `Likes: ${prettyNum(pick(d.digg_count, d.like_count, stats.digg_count))}`,
-      `Comments: ${prettyNum(pick(d.comment_count, stats.comment_count))}`,
-      `Shares: ${prettyNum(pick(d.share_count, stats.share_count))}`,
-      '', '🎞 VIDEO METADATA (provider data)',
-      `Resolution: ${video.width && video.height ? `${video.width} × ${video.height}` : 'Unavailable'}`,
-      `Original resolution: ${video.origin_width && video.origin_height ? `${video.origin_width} × ${video.origin_height}` : 'Unavailable'}`,
-      `Codec: ${pick(video.codec, video.format, 'Not provided')}`,
-      `Bitrate: ${video.bitrate || video.bit_rate ? `${(Number(video.bitrate || video.bit_rate) / 1e6).toFixed(2)} Mbps` : 'Not provided'}`,
-      `File size: ${video.size ? `${(Number(video.size) / 1048576).toFixed(2)} MB` : 'Not provided'}`,
-      `Duration: ${pick(d.duration, video.duration, 'Not provided')} sec`,
-      'Browser/phone playback: Not exposed by TikWM API',
-      'Country restriction reason: Not exposed by TikWM API'
+      `Views: ${prettyNum(d.view_count)}`,
+      `Likes: ${prettyNum(d.like_count)}`,
+      `Comments: ${prettyNum(d.comment_count)}`,
+      `Shares: ${prettyNum(d.repost_count)}`,
+      '', '🎞 SERVER-EXTRACTED VIDEO DETAILS',
+      `Duration: ${d.duration == null ? 'Unavailable' : `${Number(d.duration).toFixed(2)} sec`}`,
+      `Extracted resolution: ${d.width && d.height ? `${d.width} × ${d.height}` : 'See available formats below'}`,
+      `Available resolutions: ${formats}`,
+      `FPS: ${d.fps || 'Not provided'}`,
+      `Codec: ${pick(d.vcodec, 'Not provided in top-level metadata')}`,
+      `File size: ${d.filesize || d.filesize_approx ? `${(Number(d.filesize || d.filesize_approx)/1048576).toFixed(2)} MB${d.filesize_approx ? ' (approx.)' : ''}` : 'Not provided'}`,
+      `Description: ${pick(d.description, 'Unavailable')}`.slice(0, 1000),
+      '', 'Details are extracted by yt-dlp on the JV server. Fields not supplied by TikTok are shown as unavailable.'
     ].join('\n');
-    const buttons = [];
-    if (standard) buttons.push([Markup.button.url('⬇️ Standard Download', standard)]);
-    if (hd) buttons.push([Markup.button.url('🎯 HD Download', hd)]);
-    buttons.push([Markup.button.callback('⭐ Original / Highest Available', 'tiktok:original')]);
-    buttons.push([Markup.button.callback('🔍 Inspect downloaded media with FFmpeg', 'tiktok:inspect')]);
-    buttons.push([Markup.button.callback('⬅️ Main Menu', 'menu:main')]);
     pendingVideos.set(ctx.from.id, { ...(pendingVideos.get(ctx.from.id) || {}), tiktokUrl: url, tiktokData: d });
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, info, Markup.inlineKeyboard(buttons));
+    const buttons = [
+      [Markup.button.callback('⬇️ Download Standard (up to 720p)', 'tiktok:download:standard')],
+      [Markup.button.callback('⭐ Download Highest Available', 'tiktok:download:best')],
+      [Markup.button.callback('🔍 Download & Inspect with FFprobe', 'tiktok:inspect')],
+      [Markup.button.callback('⬅️ Main Menu', 'menu:main')]
+    ];
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, info.slice(0, 3900), Markup.inlineKeyboard(buttons));
   } catch (err) {
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ TikTok check failed: ${err.message}`).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ TikTok extraction failed: ${err.message}\n\nThis is the yt-dlp server response; TikWM is no longer used.`).catch(() => {});
   }
 }
-bot.action('tiktok:original', async (ctx) => {
-  await ctx.answerCbQuery();
-  return withBusy(ctx, async () => {
-    const p = pendingVideos.get(ctx.from.id); if (!p || !p.tiktokUrl) return ctx.reply('Send a TikTok URL using Checker & Downloader first.');
-    const msg = await ctx.reply('⭐ Requesting original/highest available quality…');
-    try { const url = await tikwmOriginal(p.tiktokUrl); await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, '✅ Original/highest-quality download link is ready:', Markup.inlineKeyboard([[Markup.button.url('⬇️ Download Original', url)]])); }
-    catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ Original download failed: ${err.message}`).catch(() => {}); }
-  });
-});
-bot.action('tiktok:inspect', async (ctx) => {
-  await ctx.answerCbQuery();
-  return withBusy(ctx, async () => {
-    const p = pendingVideos.get(ctx.from.id); const d = p && p.tiktokData;
-    if (!d) return ctx.reply('Check a TikTok URL first.');
-    const direct = d.play || d.wmplay || d.hdplay;
-    if (!direct) return ctx.reply('TikWM did not return a standard downloadable video URL.');
-    const msg = await ctx.reply('⬇️ Downloading standard video for native FFmpeg/FFprobe inspection…');
-    const filePath = tempPath(ctx.from.id, 'tiktok_inspect', '.mp4');
-    try {
-      await downloadToFile(direct, filePath);
+async function downloadTikTokAndSend(ctx, quality, inspectOnly = false) {
+  const p = pendingVideos.get(ctx.from.id);
+  if (!p || !p.tiktokUrl) return ctx.reply('Send a TikTok URL first.');
+  const msg = await ctx.reply(quality === 'best' ? '⭐ Downloading highest available quality on the server…' : '⬇️ Downloading standard quality on the server…');
+  let filePath;
+  try {
+    filePath = await ytDlpDownload(p.tiktokUrl, quality, ctx.from.id);
+    if (inspectOnly) {
       const meta = await inspectMedia(filePath);
       const stream = (meta.streams || [])[0] || {}; const format = meta.format || {};
       const size = Number(format.size || fs.statSync(filePath).size);
       const lines = [
-        '🧰 NATIVE FFMPEG INSPECTION',
+        '🧰 SERVER FFPROBE INSPECTION',
         `Codec: ${pick(stream.codec_name, 'Unavailable')}`,
         `Resolution: ${stream.width && stream.height ? `${stream.width} × ${stream.height}` : 'Unavailable'}`,
         `FPS: ${fpsValue(stream.avg_frame_rate || stream.r_frame_rate)}`,
-        `Video bitrate: ${stream.bit_rate ? `${(Number(stream.bit_rate)/1e6).toFixed(2)} Mbps` : 'Not provided by stream'}`,
+        `Video bitrate: ${stream.bit_rate ? `${(Number(stream.bit_rate)/1e6).toFixed(2)} Mbps` : 'Not provided'}`,
         `Container bitrate: ${format.bit_rate ? `${(Number(format.bit_rate)/1e6).toFixed(2)} Mbps` : 'Not provided'}`,
         `File size: ${(size/1048576).toFixed(2)} MB`,
-        `Duration: ${format.duration ? `${Number(format.duration).toFixed(2)} sec` : 'Unavailable'}`,
-        '', 'Note: These are details of the downloaded stream, not a guaranteed inventory of every server-side TikTok rendition.'
+        `Duration: ${format.duration ? `${Number(format.duration).toFixed(2)} sec` : 'Unavailable'}`
       ].join('\n');
       await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, lines);
-    } catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ FFmpeg inspection failed: ${err.message}`).catch(() => {}); }
-    finally { await fs.promises.unlink(filePath).catch(() => {}); }
-  });
+    } else {
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, '📤 Sending downloaded video…');
+      await sendVideoFile(ctx, filePath, `✅ TikTok ${quality === 'best' ? 'highest available' : 'standard'} quality downloaded by JV server`);
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, '✅ Download completed and sent.');
+    }
+  } catch (err) {
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ TikTok ${inspectOnly ? 'inspection' : 'download'} failed: ${err.message}`).catch(() => {});
+  } finally { if (filePath) await fs.promises.unlink(filePath).catch(() => {}); }
+}
+bot.action(/^tiktok:download:(standard|best)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  return withBusy(ctx, () => downloadTikTokAndSend(ctx, ctx.match[1] === 'best' ? 'best' : 'standard'));
+});
+bot.action('tiktok:inspect', async (ctx) => {
+  await ctx.answerCbQuery();
+  return withBusy(ctx, () => downloadTikTokAndSend(ctx, 'best', true));
 });
 
 bot.on('text', async (ctx) => {

@@ -24,3 +24,24 @@
 - The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html`; its API workflow is adapted to Telegram messages/buttons. The supplied TikWM HTML exposes `region`, creator/video metadata, standard links and an original-quality task API. It explicitly does not expose browser/phone playback quality. The country restriction reason is not provided by that API.
 - FFprobe inspects the downloaded rendition only; it cannot discover all private/server-side TikTok variants.
 - The original Luna and FFmpeg method source files are retained.
+
+
+## TikTok checker/downloader (yt-dlp)
+
+TikWM has been removed. TikTok URLs are now inspected and downloaded by `yt-dlp` running on the JV server. The bot requests JSON metadata from yt-dlp, displays fields that the extractor actually returns, and offers standard (up to 720p when available) and highest-available downloads. The inspect action downloads the highest available rendition and runs the server's FFprobe against that file.
+
+### Install yt-dlp
+
+The included `Dockerfile` installs yt-dlp in a Python virtual environment and sets `YTDLP_PATH` automatically. For a non-Docker deployment, install a current yt-dlp release on the host and set `YTDLP_PATH` to its executable path. Keep yt-dlp updated because TikTok may change its site behavior.
+
+Example local setup:
+
+```bash
+python3 -m venv .venv-ytdlp
+.venv-ytdlp/bin/pip install -U yt-dlp
+YTDLP_PATH="$PWD/.venv-ytdlp/bin/yt-dlp" npm start
+```
+
+The metadata shown is limited to what TikTok and the current yt-dlp extractor make available. Region, likes, comments, or other fields may be missing. This is self-hosted software with no paid downloader API quota, but it is not literally unlimited: server CPU, storage, bandwidth, and TikTok access controls still apply.
+
+**Telegram file-transfer note:** this update replaces TikWM with yt-dlp; it does not yet add MTProto. The existing Telegraf Bot API transfer path still has Telegram's standard file-size restrictions.
