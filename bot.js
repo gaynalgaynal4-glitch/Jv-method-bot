@@ -1,13 +1,10 @@
-// JV Methods Bot — Enhanced / HD (Luna + Jarvis) / FFmpeg
+// JV Methods Bot — Enhanced / HD (Luna + Jarvis) / FFmpeg / TikTok Checker
 // Requires Node.js 18+. Kuronai routes and payloads are taken from the supplied extension.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { pipeline } = require('stream/promises');
-const { Transform } = require('stream');
-const { downloadTelegramMessage, uploadTelegramVideo, startTelegramTransfer, stopTelegramTransfer } = require('./telegram-transfer');
 const { execFile } = require('child_process');
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
@@ -18,8 +15,9 @@ const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
 const WEBHOOK_PATH = `/webhook/${process.env.WEBHOOK_SECRET || 'jv-bot'}`;
 const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
-const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 200);
+const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
 const KURONAI_API = 'https://api.kuronaiapp.com';
+const TIKWM_API = 'https://www.tikwm.com/api/';
 const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
 const FFPROBE_PKG = require('ffprobe-static');
 const FFPROBE = process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
@@ -67,99 +65,89 @@ async function editProgress(ctx, messageId, text, force = false) {
   ctx.__lastProgressEdit = now;
   try { await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text); } catch (_) {}
 }
-async function telegramDownload(ctx, file, userId) {
-  const ext = path.extname(file.file_name || '') || '.mp4';
-  const inputPath = tempPath(userId, 'input', ext);
-  try {
-    const bytes = await downloadTelegramMessage(ctx.chat.id, ctx.message.message_id, inputPath);
-    if (bytes > MAX_VIDEO_MB * 1024 * 1024) throw new Error(`Video exceeds ${MAX_VIDEO_MB} MB limit.`);
-    return inputPath;
-  } catch (err) {
-    await fs.promises.unlink(inputPath).catch(() => {});
-    throw err;
-  }
-}
-async function sendVideoFile(ctx, filePath, caption) {
-  const stat = await fs.promises.stat(filePath);
-  if (!stat.size) throw new Error('Cannot upload an empty video file.');
-  if (stat.size > MAX_VIDEO_MB * 1024 * 1024) throw new Error(`Output exceeds the configured ${MAX_VIDEO_MB} MB limit.`);
-  await uploadTelegramVideo(ctx.chat.id, filePath, caption, ctx.message && ctx.message.message_thread_id);
-}
-
-async function streamResponseToFile(response, outputPath, maxBytes = MAX_VIDEO_MB * 1024 * 1024, onProgress) {
+async function downloadToFile(url, destPath, maxBytes = MAX_VIDEO_MB * 1024 * 1024) {
+  const response = await fetch(url, { redirect: 'follow' });
   if (!response.ok) throw new Error(`Download failed: HTTP ${response.status}`);
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared && declared > maxBytes) throw new Error(`File exceeds ${MAX_VIDEO_MB} MB limit.`);
-  let received = 0;
-  const limiter = new Transform({
-    transform(chunk, encoding, callback) {
-      received += chunk.length;
-      if (received > maxBytes) return callback(new Error(`File exceeds ${MAX_VIDEO_MB} MB limit.`));
-      if (onProgress && declared) onProgress(Math.round(received / declared * 100));
-      callback(null, chunk);
-    }
-  });
-  await pipeline(response.body, limiter, fs.createWriteStream(outputPath));
-  if (!received) throw new Error('The downloaded file is empty.');
-  return received;
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('The downloaded file is empty.');
+  if (buffer.length > maxBytes) throw new Error(`File exceeds ${MAX_VIDEO_MB} MB limit.`);
+  await fs.promises.writeFile(destPath, buffer);
+  return buffer.length;
+}
+async function telegramDownload(ctx, file, userId) {
+  const link = await ctx.telegram.getFileLink(file.file_id);
+  const ext = path.extname(file.file_name || '') || '.mp4';
+  const inputPath = tempPath(userId, 'input', ext);
+  await downloadToFile(link.href, inputPath);
+  return inputPath;
+}
+async function sendVideoFile(ctx, filePath, caption) {
+  const size = fs.statSync(filePath).size;
+  if (size > 49 * 1024 * 1024) throw new Error('Output is larger than Telegram bot video upload limit.');
+  await ctx.telegram.sendVideo(ctx.chat.id, { source: fs.createReadStream(filePath), filename: safeName(path.basename(filePath)) }, { caption: String(caption || '').slice(0, 900) });
 }
 
 // Kuronai upload protocol copied from inject.js:
 // POST /uploaden/ for Enhanced; POST /upload/ for HQ; multipart file/tg_id/progress;
 // /upload/ additionally receives encode_video=true|false. Response may be NDJSON progress.
 async function kuronaiUpload(inputPath, telegramId, route, encodeVideo, onProgress) {
-  const FormData = require('form-data');
-  const https = require('https');
+  const buffer = await fs.promises.readFile(inputPath);
   const form = new FormData();
-  form.append('file', fs.createReadStream(inputPath), { filename: safeName(path.basename(inputPath)), contentType: 'video/mp4' });
+  form.append('file', new Blob([buffer], { type: 'video/mp4' }), safeName(path.basename(inputPath)));
   form.append('tg_id', String(telegramId));
   form.append('progress', 'true');
   if (route === '/upload/') form.append('encode_video', String(Boolean(encodeVideo)));
 
-  const response = await new Promise((resolve, reject) => {
-    const req = https.request(KURONAI_API + route, {
-      method: 'POST',
-      headers: form.getHeaders(),
-      timeout: 15 * 60 * 1000,
-    }, resolve);
-    req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('Kuronai upload timed out.')));
-    form.on('error', reject);
-    form.pipe(req);
-  });
-  const chunks = [];
-  let total = 0;
-  for await (const chunk of response) {
-    total += chunk.length;
-    if (total > 2 * 1024 * 1024) throw new Error('Kuronai response exceeded 2 MB.');
-    chunks.push(chunk);
-  }
-  const body = Buffer.concat(chunks).toString('utf8');
-  if (response.statusCode < 200 || response.statusCode >= 300) {
+  const response = await fetch(KURONAI_API + route, { method: 'POST', body: form });
+  if (!response.ok) {
     let detail = '';
-    try { const j = JSON.parse(body); detail = j.detail || j.message || ''; } catch (_) {}
-    throw new Error(detail || `Kuronai upload failed (HTTP ${response.statusCode}).`);
+    try { const j = await response.json(); detail = j.detail || j.message || ''; } catch (_) {}
+    throw new Error(detail || `Kuronai upload failed (HTTP ${response.status}).`);
   }
-  const contentType = String(response.headers['content-type'] || '');
+  const contentType = response.headers.get('content-type') || '';
   let result = null;
-  if (contentType.includes('application/x-ndjson')) {
-    for (const line of body.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      let event;
-      try { event = JSON.parse(line); } catch (_) { continue; }
-      if (event.type === 'error') throw new Error(event.message || event.code || 'Kuronai server processing failed.');
-      if (event.type === 'progress' && onProgress) onProgress(event);
-      if (event.type === 'complete') result = event;
+  if (contentType.includes('application/x-ndjson') && response.body) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      pending += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = pending.split('\n'); pending = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let event; try { event = JSON.parse(line); } catch (_) { continue; }
+        if (event.type === 'error') throw new Error(event.message || event.code || 'Kuronai server processing failed.');
+        if (event.type === 'progress' && onProgress) onProgress(event);
+        if (event.type === 'complete') result = event;
+      }
+      if (done) break;
+    }
+    if (pending.trim()) {
+      try { const event = JSON.parse(pending); if (event.type === 'progress' && onProgress) onProgress(event); if (event.type === 'complete') result = event; if (event.type === 'error') throw new Error(event.message || event.code); } catch (e) { if (e.message && !e.message.includes('Unexpected')) throw e; }
     }
   } else {
-    try { result = JSON.parse(body); } catch (_) { throw new Error('Kuronai returned invalid JSON.'); }
+    result = await response.json();
   }
   if (!result || typeof result.file_id !== 'string' || !result.file_id) throw new Error('Kuronai response did not contain a file_id.');
   return result.file_id;
 }
 async function kuronaiDownload(fileId, outputPath, onProgress) {
   const response = await fetch(`${KURONAI_API}/download/${encodeURIComponent(fileId)}`);
-  return streamResponseToFile(response, outputPath, MAX_VIDEO_MB * 1024 * 1024, onProgress);
+  if (!response.ok) throw new Error(`Kuronai result download failed (HTTP ${response.status}).`);
+  const total = Number(response.headers.get('content-length') || 0);
+  const reader = response.body.getReader();
+  const chunks = []; let received = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    chunks.push(Buffer.from(value)); received += value.length;
+    if (onProgress && total) onProgress(Math.round(received / total * 100));
+  }
+  await fs.promises.writeFile(outputPath, Buffer.concat(chunks));
+  if (!received) throw new Error('Kuronai returned an empty output file.');
 }
 async function kuronaiCleanup(fileId) {
   try { await fetch(`${KURONAI_API}/cleanup/${encodeURIComponent(fileId)}`, { method: 'DELETE' }); } catch (_) {}
@@ -172,7 +160,6 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   const started = Date.now();
   const status = await ctx.reply(`⚙️ ${title}\nPreparing upload…\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: waiting for server…\nElapsed: 00:00:00`);
   let fileId;
-  let outputPath;
   let lastPercent = null;
   let lastStage = 'Uploading';
   const timer = setInterval(() => {
@@ -187,7 +174,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
       editProgress(ctx, status.message_id, `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`).catch(() => {});
     });
     await editProgress(ctx, status.message_id, `⬇️ ${title}\nServer processing complete. Downloading result…\nElapsed: ${fmtTime(Date.now() - started)}`, true);
-    outputPath = tempPath(ctx.from.id, enhanced ? 'enhanced_result' : 'jarvis_result', '.mp4');
+    const outputPath = tempPath(ctx.from.id, enhanced ? 'enhanced_result' : 'jarvis_result', '.mp4');
     await kuronaiDownload(fileId, outputPath, (percent) => {
       editProgress(ctx, status.message_id, `⬇️ ${title}\nDownloading result: ${percent}%\nElapsed: ${fmtTime(Date.now() - started)}`).catch(() => {});
     });
@@ -196,11 +183,9 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     await fs.promises.unlink(outputPath).catch(() => {});
     await editProgress(ctx, status.message_id, `✅ ${title} completed\nElapsed: ${fmtTime(Date.now() - started)}`, true);
     pendingVideos.delete(ctx.from.id);
-    await fs.promises.unlink(pending.inputPath).catch(() => {});
   } finally {
     clearInterval(timer);
     if (fileId) await kuronaiCleanup(fileId);
-    if (outputPath) await fs.promises.unlink(outputPath).catch(() => {});
   }
 }
 
@@ -222,7 +207,6 @@ async function runLocalMethod(ctx, pending, methodKey, options = {}) {
     await sendVideoFile(ctx, outputPath, caption);
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, '✅ Processing complete.');
     pendingVideos.delete(userId);
-    await fs.promises.unlink(pending.inputPath).catch(() => {});
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Processing failed: ${err.message}`).catch(() => {});
     throw err;
@@ -234,6 +218,7 @@ function mainKeyboard() {
     [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
     [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
     [Markup.button.callback('🧰 FFmpeg Method', 'menu:ffmpeg')],
+    [Markup.button.callback('🔎 Checker & Downloader', 'menu:checker')],
   ]);
 }
 function hdKeyboard() {
@@ -257,16 +242,14 @@ function ffmpegKeyboard() {
   ]);
 }
 
-bot.start((ctx) => ctx.reply('👋 JV Methods Bot\n\nSend a video to process it.', mainKeyboard()));
-bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis), or FFmpeg.'));
+bot.start((ctx) => ctx.reply('👋 JV Methods Bot\n\nSend a video to process it, or use Checker & Downloader to inspect a public TikTok URL.', mainKeyboard()));
+bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis), or FFmpeg. For TikTok links choose Checker & Downloader.'));
 
 bot.on(['video', 'document'], async (ctx) => {
   const file = ctx.message.video || ctx.message.document;
   if (!file || (ctx.message.document && !(file.mime_type || '').startsWith('video/'))) return;
   const sizeMB = (file.file_size || 0) / 1048576;
   if (sizeMB > MAX_VIDEO_MB) return ctx.reply(`⚠️ Video is ${sizeMB.toFixed(1)} MB. Maximum is ${MAX_VIDEO_MB} MB.`);
-  const oldPending = pendingVideos.get(ctx.from.id);
-  if (oldPending && oldPending.inputPath) await fs.promises.unlink(oldPending.inputPath).catch(() => {});
   const status = await ctx.reply('📥 Downloading your video…');
   try {
     const inputPath = await telegramDownload(ctx, file, ctx.from.id);
@@ -281,6 +264,12 @@ bot.action('menu:main', async (ctx) => { await ctx.answerCbQuery(); return ctx.e
 bot.action('menu:hd', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('⚠️ HD METHOD\nChoose a processing engine:', hdKeyboard()); });
 bot.action('menu:jarvis', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\nChoose whether Kuronai should re-encode the video:', optimizerKeyboard()); });
 bot.action('menu:ffmpeg', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('🎞 FFmpeg Method\nChoose target FPS:', ffmpegKeyboard()); });
+bot.action('menu:checker', async (ctx) => {
+  await ctx.answerCbQuery();
+  pendingVideos.set(ctx.from.id, { ...(pendingVideos.get(ctx.from.id) || {}), awaitingTikTokUrl: true });
+  return ctx.reply('🔎 Checker & Downloader\nSend a public TikTok video URL. I will retrieve available region, creator, video metadata, standard download and original/highest-quality download links.');
+});
+
 async function getPending(ctx) {
   const p = pendingVideos.get(ctx.from.id);
   if (!p || !p.inputPath || !fs.existsSync(p.inputPath)) {
@@ -313,10 +302,153 @@ bot.action(/^ffmpeg:fps:(30|60)$/, async (ctx) => {
   return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runLocalMethod(ctx, p, 'ffmpeg', { targetFps: fps }); });
 });
 
-bot.catch((err, ctx) => {
-  console.error('[bot] Unhandled update error:', err && err.stack ? err.stack : err);
-  if (ctx) ctx.reply(`❌ Operation failed: ${(err && err.message ? err.message : 'Unknown error').slice(0, 700)}`).catch(() => {});
+// TikWM checker flow adapted from the supplied HTML. The HTML exposes region,
+// metadata and download URLs; it does not expose browser/phone playback probing or a country-ban reason.
+function validTikTokUrl(value) {
+  try { const u = new URL(value); return /(^|\.)tiktok\.com$/i.test(u.hostname); } catch (_) { return false; }
+}
+function pick(...values) { return values.find(v => v !== undefined && v !== null && v !== ''); }
+function prettyNum(v) { return v == null ? 'Unavailable' : Number(v).toLocaleString('en-US'); }
+async function tikwmCheck(url) {
+  const response = await fetch(TIKWM_API + '?url=' + encodeURIComponent(url), { headers: { Accept: 'application/json' } });
+  if (!response.ok) throw new Error(`TikWM returned HTTP ${response.status}`);
+  const payload = await response.json();
+  if (payload.code !== 0 || !payload.data) throw new Error(payload.msg || 'TikTok video could not be retrieved.');
+  return payload.data;
+}
+async function tikwmOriginal(url) {
+  const submit = await fetch('https://www.tikwm.com/api/video/task/submit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://www.tikwm.com/originalDownloader.html' },
+    body: 'url=' + encodeURIComponent(url) + '&web=1'
+  });
+  if (!submit.ok) throw new Error(`Original downloader returned HTTP ${submit.status}`);
+  const payload = await submit.json();
+  const taskId = payload && payload.data && payload.data.task_id;
+  if (payload.code !== 0 || !taskId) throw new Error(payload.msg || 'Could not start original-quality task.');
+  for (let i = 0; i < 15; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const response = await fetch('https://www.tikwm.com/api/video/task/result?task_id=' + encodeURIComponent(taskId));
+    if (!response.ok) continue;
+    const result = await response.json();
+    if (result.code === 0 && result.data) {
+      const d = result.data.detail || result.data;
+      const link = d.play_url || d.download_url || d.play;
+      if (link) return link;
+      if (['failed', 'error'].includes(result.data.status)) throw new Error('Provider could not create the original file.');
+    }
+  }
+  throw new Error('Original-quality link was not returned in time.');
+}
+async function inspectMedia(filePath) {
+  return new Promise((resolve, reject) => {
+    execFile(FFPROBE, ['-v','error','-select_streams','v:0','-show_entries','stream=codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate','-show_entries','format=duration,size,bit_rate','-of','json',filePath], { maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error((stderr || err.message).slice(-1200)));
+      try { resolve(JSON.parse(stdout)); } catch (_) { reject(new Error('Could not parse FFprobe media details.')); }
+    });
+  });
+}
+function fpsValue(value) {
+  if (!value || value === '0/0') return 'Unavailable';
+  const [a,b='1'] = String(value).split('/'); const n = Number(a) / Number(b);
+  return Number.isFinite(n) ? n.toFixed(3) : 'Unavailable';
+}
+async function processTikTokUrl(ctx, url) {
+  const status = await ctx.reply('🔎 Checking TikTok URL…');
+  try {
+    const d = await tikwmCheck(url);
+    const video = d.video || {};
+    const author = d.author || {};
+    const stats = d.statistics || d.stats || {};
+    const region = pick(d.region, d.region_code, d.created_region, 'Not provided by TikWM');
+    const standard = d.play || d.wmplay || d.hdplay || null;
+    const hd = d.hdplay || null;
+    const info = [
+      '✅ TIKTOK VIDEO FOUND',
+      `Title: ${pick(d.title, 'TikTok video')}`,
+      `Creator: @${pick(author.unique_id, author.username, 'unknown')}`,
+      `Region/Country code: ${region}`,
+      `Video ID: ${pick(d.id, d.aweme_id, d.video_id, 'Unavailable')}`,
+      '', '📊 STATISTICS',
+      `Views: ${prettyNum(pick(d.play_count, stats.play_count, stats.view_count))}`,
+      `Likes: ${prettyNum(pick(d.digg_count, d.like_count, stats.digg_count))}`,
+      `Comments: ${prettyNum(pick(d.comment_count, stats.comment_count))}`,
+      `Shares: ${prettyNum(pick(d.share_count, stats.share_count))}`,
+      '', '🎞 VIDEO METADATA (provider data)',
+      `Resolution: ${video.width && video.height ? `${video.width} × ${video.height}` : 'Unavailable'}`,
+      `Original resolution: ${video.origin_width && video.origin_height ? `${video.origin_width} × ${video.origin_height}` : 'Unavailable'}`,
+      `Codec: ${pick(video.codec, video.format, 'Not provided')}`,
+      `Bitrate: ${video.bitrate || video.bit_rate ? `${(Number(video.bitrate || video.bit_rate) / 1e6).toFixed(2)} Mbps` : 'Not provided'}`,
+      `File size: ${video.size ? `${(Number(video.size) / 1048576).toFixed(2)} MB` : 'Not provided'}`,
+      `Duration: ${pick(d.duration, video.duration, 'Not provided')} sec`,
+      'Browser/phone playback: Not exposed by TikWM API',
+      'Country restriction reason: Not exposed by TikWM API'
+    ].join('\n');
+    const buttons = [];
+    if (standard) buttons.push([Markup.button.url('⬇️ Standard Download', standard)]);
+    if (hd) buttons.push([Markup.button.url('🎯 HD Download', hd)]);
+    buttons.push([Markup.button.callback('⭐ Original / Highest Available', 'tiktok:original')]);
+    buttons.push([Markup.button.callback('🔍 Inspect downloaded media with FFmpeg', 'tiktok:inspect')]);
+    buttons.push([Markup.button.callback('⬅️ Main Menu', 'menu:main')]);
+    pendingVideos.set(ctx.from.id, { ...(pendingVideos.get(ctx.from.id) || {}), tiktokUrl: url, tiktokData: d });
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, info, Markup.inlineKeyboard(buttons));
+  } catch (err) {
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ TikTok check failed: ${err.message}`).catch(() => {});
+  }
+}
+bot.action('tiktok:original', async (ctx) => {
+  await ctx.answerCbQuery();
+  return withBusy(ctx, async () => {
+    const p = pendingVideos.get(ctx.from.id); if (!p || !p.tiktokUrl) return ctx.reply('Send a TikTok URL using Checker & Downloader first.');
+    const msg = await ctx.reply('⭐ Requesting original/highest available quality…');
+    try { const url = await tikwmOriginal(p.tiktokUrl); await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, '✅ Original/highest-quality download link is ready:', Markup.inlineKeyboard([[Markup.button.url('⬇️ Download Original', url)]])); }
+    catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ Original download failed: ${err.message}`).catch(() => {}); }
+  });
 });
+bot.action('tiktok:inspect', async (ctx) => {
+  await ctx.answerCbQuery();
+  return withBusy(ctx, async () => {
+    const p = pendingVideos.get(ctx.from.id); const d = p && p.tiktokData;
+    if (!d) return ctx.reply('Check a TikTok URL first.');
+    const direct = d.play || d.wmplay || d.hdplay;
+    if (!direct) return ctx.reply('TikWM did not return a standard downloadable video URL.');
+    const msg = await ctx.reply('⬇️ Downloading standard video for native FFmpeg/FFprobe inspection…');
+    const filePath = tempPath(ctx.from.id, 'tiktok_inspect', '.mp4');
+    try {
+      await downloadToFile(direct, filePath);
+      const meta = await inspectMedia(filePath);
+      const stream = (meta.streams || [])[0] || {}; const format = meta.format || {};
+      const size = Number(format.size || fs.statSync(filePath).size);
+      const lines = [
+        '🧰 NATIVE FFMPEG INSPECTION',
+        `Codec: ${pick(stream.codec_name, 'Unavailable')}`,
+        `Resolution: ${stream.width && stream.height ? `${stream.width} × ${stream.height}` : 'Unavailable'}`,
+        `FPS: ${fpsValue(stream.avg_frame_rate || stream.r_frame_rate)}`,
+        `Video bitrate: ${stream.bit_rate ? `${(Number(stream.bit_rate)/1e6).toFixed(2)} Mbps` : 'Not provided by stream'}`,
+        `Container bitrate: ${format.bit_rate ? `${(Number(format.bit_rate)/1e6).toFixed(2)} Mbps` : 'Not provided'}`,
+        `File size: ${(size/1048576).toFixed(2)} MB`,
+        `Duration: ${format.duration ? `${Number(format.duration).toFixed(2)} sec` : 'Unavailable'}`,
+        '', 'Note: These are details of the downloaded stream, not a guaranteed inventory of every server-side TikTok rendition.'
+      ].join('\n');
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, lines);
+    } catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ FFmpeg inspection failed: ${err.message}`).catch(() => {}); }
+    finally { await fs.promises.unlink(filePath).catch(() => {}); }
+  });
+});
+
+bot.on('text', async (ctx) => {
+  const text = (ctx.message.text || '').trim();
+  const pending = pendingVideos.get(ctx.from.id);
+  if (pending && pending.awaitingTikTokUrl) {
+    if (!validTikTokUrl(text)) return ctx.reply('That does not look like a valid TikTok URL. Please send a public tiktok.com link.');
+    pending.awaitingTikTokUrl = false;
+    pendingVideos.set(ctx.from.id, pending);
+    return processTikTokUrl(ctx, text);
+  }
+  if (validTikTokUrl(text)) return processTikTokUrl(ctx, text);
+});
+
+bot.catch((err, ctx) => { console.error('Bot error:', err); if (ctx) ctx.reply('❌ Something went wrong. Please try again.').catch(() => {}); });
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -324,8 +456,6 @@ app.get('/', (_req, res) => res.json({ status: 'ok', service: 'JV Methods Bot' }
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`[server] Listening on ${PORT}`);
-  try { await startTelegramTransfer(); }
-  catch (err) { console.error('[mtproto] Startup failed:', err.stack || err); process.exit(1); }
   if (PUBLIC_URL) {
     try { await bot.telegram.setWebhook(`${PUBLIC_URL}${WEBHOOK_PATH}`); console.log('[bot] Webhook registered.'); }
     catch (err) { console.error('[bot] Webhook registration failed:', err.message); }
@@ -337,11 +467,3 @@ app.listen(PORT, '0.0.0.0', async () => {
     { command: 'help', description: 'How to use the bot' }
   ]);
 });
-
-async function shutdown(signal) {
-  console.log(`[server] ${signal} received; shutting down.`);
-  try { await stopTelegramTransfer(); } catch (_) {}
-  process.exit(0);
-}
-process.once('SIGINT', () => shutdown('SIGINT'));
-process.once('SIGTERM', () => shutdown('SIGTERM'));

@@ -1,38 +1,26 @@
-# JV Methods Bot v2.1
+# JV Methods Bot v2.0
 
-Telegram video processing bot using MTProto for Telegram media downloads and uploads.
+## Features
+- **Enhanced Method**: Kuronai `POST https://api.kuronaiapp.com/uploaden/`.
+- **HD Method**: Luna (the original MP4Patcher adapter) or Jarvis HQ (`POST /upload/`).
+- **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
+- **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
+- **FFmpeg Method**: original timestamp-scaling method, with 30/60 FPS selection.
+- **Checker & Downloader**: TikWM metadata, region field where returned, standard/HD download links, original-quality task flow, and native FFprobe inspection of the downloaded stream.
 
-## Features retained
-- **Enhanced Method** — Kuronai `/uploaden/`.
-- **HD Method**
-  - **Luna (MP4Patcher)** — original local MP4 patcher adapter.
-  - **Jarvis HQ** — Kuronai `/upload/`, with Optimizer ON/OFF.
-- **FFmpeg Method** — original timestamp-scaling workflow with 30 FPS or 60 FPS selection.
-- Video and video-document uploads are accepted.
+## Deploy
+1. Use Node.js 18 or newer.
+2. Set `BOT_TOKEN` to your Telegram bot token.
+3. Set `RENDER_EXTERNAL_URL` (automatically provided by Render) or `PUBLIC_URL` to your public HTTPS service URL.
+4. Optional: set `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, `FFMPEG_PATH`, or `FFPROBE_PATH`.
+5. Run `npm install` then `npm start`.
+6. Deploy as a Render Web Service, not a static site.
 
-The TikTok checker/downloader and all TikTok URL handling have been removed.
-
-## Deploy on Render (Node Web Service)
-1. Upload this project to your GitHub repository.
-2. Create or update a Render **Web Service** using the repository.
-3. Runtime: Node. Build command: `npm install`. Start command: `npm start`.
-4. Set these environment variables:
-   - `BOT_TOKEN` — token from BotFather.
-   - `API_ID` and `API_HASH` — obtain them from https://my.telegram.org.
-   - `RENDER_EXTERNAL_URL` — Render normally provides this automatically.
-   - `WEBHOOK_SECRET` — long random string.
-   - `MAX_VIDEO_MB` — optional, defaults to 200.
-5. Deploy. Startup logs should include `[mtproto] Telegram media transfer connected.` and `[bot] Webhook registered.`
-
-## MTProto notes
-- Uses GramJS bot authorization with the same `BOT_TOKEN`, plus `API_ID` and `API_HASH`.
-- Telegram media is downloaded by retrieving the original message with MTProto and writing it to a temporary file.
-- Processed videos are uploaded through MTProto, including files larger than the ordinary Bot API video-upload limit, subject to Telegram's current account/API limits.
-- No user session string is required or stored.
-- Do not expose `.env` or credentials in Git.
-
-## Validation and limitations
-- `npm run check` validates JavaScript syntax for the bot and retained processing modules.
-- This is not a live integration test. Real Telegram MTProto authentication, Kuronai API behavior, and FFmpeg processing must be verified after deployment with your credentials and a test video.
-- Luna's original MP4Patcher reads the entire MP4 into memory. Large files can therefore use substantial RAM.
-- The FFmpeg method copies streams and changes timestamps; it does not re-encode the video.
+## Important behavior and limitations
+- The bot sends the Telegram user ID as `tg_id`, matching the extension's upload request. It does not hardcode one person's ID.
+- Jarvis ON sends `encode_video=true`; OFF sends `encode_video=false` to `/upload/`.
+- The extension's `/uploaden/` route is used for Enhanced and does not send `encode_video`.
+- Actual server encoding percentages are displayed only when the server emits a numeric `percent` in its NDJSON `progress` events. The elapsed timer continues independently.
+- The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html`; its API workflow is adapted to Telegram messages/buttons. The supplied TikWM HTML exposes `region`, creator/video metadata, standard links and an original-quality task API. It explicitly does not expose browser/phone playback quality. The country restriction reason is not provided by that API.
+- FFprobe inspects the downloaded rendition only; it cannot discover all private/server-side TikTok variants.
+- The original Luna and FFmpeg method source files are retained.
