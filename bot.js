@@ -707,7 +707,7 @@ function execYtDlp(command, commandArgs, timeout) {
   });
 }
 
-// MAIN FIX: MATCH THE PYTHON INTERPRETER WITH THE INSTALLED YT-DLP MODULE.
+// MATCH THE PYTHON INTERPRETER WITH THE INSTALLED YT-DLP MODULE.
 
 async function runYtDlp(args, timeout = 20 * 60 * 1000) {
   const executableCandidates = [
@@ -772,16 +772,21 @@ async function runYtDlp(args, timeout = 20 * 60 * 1000) {
   );
 }
 
+// TIKTOK METADATA EXTRACTION
+
 async function ytDlpInfo(url) {
   const { stdout } = await runYtDlp([
     '--dump-single-json',
     '--no-warnings',
     '--no-playlist',
-    '--no-call-home',
     '--retries',
-    '2',
+    '3',
     '--extractor-retries',
-    '2',
+    '3',
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    '--referer',
+    'https://www.tiktok.com/',
     url
   ], 180000);
 
@@ -835,11 +840,14 @@ async function ytDlpDownload(url, quality, userId) {
     '--no-warnings',
     '--no-playlist',
     '--no-part',
-    '--no-call-home',
     '--retries',
     '3',
     '--fragment-retries',
     '3',
+    '--user-agent',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+    '--referer',
+    'https://www.tiktok.com/',
     '-f',
     selector,
     '--merge-output-format',
@@ -1148,4 +1156,3 @@ app.listen(PORT, '0.0.0.0', async () => {
     { command: 'start', description: 'Start the bot' },
     { command: 'help', description: 'How to use the bot' }
   ]);
-});
