@@ -16,6 +16,17 @@
 5. Run `npm install` then `npm start`.
 6. Deploy as a Render Web Service, not a static site.
 
+## Telegram delivery (v2.1 fix)
+- **Upload path:** processed videos are sent to the Bot API with Node's native `fetch` + `FormData`. This is a normal `Content-Length` upload (what `curl -F video=@file.mp4` sends) instead of Telegraf's chunked stream, which Telegram was dropping with `socket hang up`. Up to 4 attempts with backoff (honours Telegram's `retry_after`), then the unchanged MP4 is sent as a document.
+- **Progress message:** the live "Server encoding / Stage" updater now stops the moment the server job finishes, so it no longer overwrites "Sending processed video to Telegram…".
+- **Background jobs:** processing runs outside the webhook handler, so Telegraf's 90 s handler timeout can no longer print "Something went wrong" while the job is still working.
+- **Token safety:** error text shown to users is scrubbed of the bot token (Telegram library errors embed `.../bot<TOKEN>/method`).
+- Optional env `TELEGRAM_API_ROOT` points the bot at a self-hosted Bot API server; `TELEGRAM_UPLOAD_TIMEOUT_MS` (default 600000) caps one upload attempt.
+
+## Checker & Downloader / TikWM (v2.1 fix)
+- TikWM answered the bot's bare Node request with `HTTP 403` (it works in a browser, which is why the supplied HTML works). Every TikWM call now sends browser-like headers (User-Agent, Origin, Referer), tries `www.tikwm.com` then `tikwm.com`, retries once on TikWM's 1-request/second limit, and gives a readable error for block pages. Downloads from tikwm.com use the same headers, and relative TikWM links are made absolute so Telegram buttons accept them.
+- If your host's **IP address** is blocked, headers cannot help. The bot log shows the real reason (`[tikwm] https://www.tikwm.com/api -> HTTP 403 …`). Then either wait/redeploy to a different region, or run `tools/tikwm-relay-worker.js` as a Cloudflare Worker and set `TIKWM_API_BASE=https://<worker>.workers.dev` (comma-separate several bases to try them in order).
+
 ## Important behavior and limitations
 - The bot sends the Telegram user ID as `tg_id`, matching the extension's upload request. It does not hardcode one person's ID.
 - Jarvis ON sends `encode_video=true`; OFF sends `encode_video=false` to `/upload/`.

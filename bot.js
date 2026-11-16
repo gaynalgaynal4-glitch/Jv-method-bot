@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const https = require('https');
 const { execFile } = require('child_process');
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
@@ -21,7 +22,19 @@ const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
 const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || '@jv_60fps';
 const REQUIRED_CHANNEL_URL = process.env.REQUIRED_CHANNEL_URL || 'https://t.me/jv_60fps';
 const KURONAI_API = 'https://api.kuronaiapp.com';
-const TIKWM_API = 'https://www.tikwm.com/api/';
+// Optional: point at a self-hosted Telegram Bot API server (lifts the 50 MB upload limit).
+const TELEGRAM_API_ROOT = (process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org').replace(/\/$/, '');
+// TikWM sits behind bot protection and answers Node's bare default request (User-Agent "node", no Referer)
+// with HTTP 403 even though the same call works from a browser. We send browser-like headers and try both hostnames.
+// TIKWM_API_BASE may hold one or more comma-separated base URLs (e.g. your own relay) and replaces the defaults.
+const TIKWM_HOSTS = (process.env.TIKWM_API_BASE || 'https://www.tikwm.com,https://tikwm.com')
+  .split(',').map(h => h.trim().replace(/\/$/, '')).filter(Boolean);
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  Origin: 'https://www.tikwm.com',
+  Referer: 'https://www.tikwm.com/',
+};
 const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
 const FFPROBE_PKG = require('ffprobe-static');
 const FFPROBE = process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
@@ -32,7 +45,20 @@ if (typeof fetch !== 'function' || typeof FormData !== 'function' || typeof Blob
 }
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
-const bot = new Telegraf(BOT_TOKEN);
+// Never show the bot token to users. Network errors from Telegram libraries embed the full
+// request URL (".../bot<TOKEN>/sendVideo"), so every user-visible error goes through this.
+function scrub(value) {
+  return String(value == null ? '' : value)
+    .split(BOT_TOKEN).join('[bot-token]')
+    .replace(/bot\d{6,}:[A-Za-z0-9_-]{20,}/g, 'bot[token]');
+}
+
+const bot = new Telegraf(BOT_TOKEN, {
+  // Long jobs now run in the background (see withBusy), but never let Telegraf abort a handler at its 90 s default.
+  handlerTimeout: 30 * 60 * 1000,
+  // Fresh connection per API call: a pooled keep-alive socket that Telegram already closed is a classic "socket hang up".
+  telegram: { agent: new https.Agent({ keepAlive: false }) },
+});
 const pendingVideos = new Map();
 const busyUsers = new Set();
 
@@ -51,7 +77,7 @@ bot.use(async (ctx, next) => {
       [Markup.button.url('📢 Join JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
       [Markup.button.callback('✅ I Joined — Check Again', 'membership:check')],
     ]);
-    const message = '🔒 Channel Membership Required\\n\\nPlease join our channel first to use this bot. After joining, tap “I Joined — Check Again”.';
+    const message = '🔒 Channel Membership Required\n\nPlease join our channel first to use this bot. After joining, tap “I Joined — Check Again”.';
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery('Please join the required channel first.', { show_alert: true }).catch(() => {});
       await ctx.reply(message, keyboard).catch(() => {});
@@ -102,10 +128,13 @@ async function editProgress(ctx, messageId, text, force = false) {
   const now = Date.now();
   if (!force && ctx.__lastProgressEdit && now - ctx.__lastProgressEdit < 1100) return;
   ctx.__lastProgressEdit = now;
-  try { await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, text); } catch (_) {}
+  try { await ctx.telegram.editMessageText(ctx.chat.id, messageId, undefined, scrub(text)); } catch (_) {}
+}
+function mediaHeaders(url) {
+  try { return /(^|\.)tikwm\.com$/i.test(new URL(url).hostname) ? BROWSER_HEADERS : {}; } catch (_) { return {}; }
 }
 async function downloadToFile(url, destPath, maxBytes = MAX_VIDEO_MB * 1024 * 1024) {
-  const response = await fetch(url, { redirect: 'follow' });
+  const response = await fetch(url, { redirect: 'follow', headers: mediaHeaders(url) });
   if (!response.ok) throw new Error(`Download failed: HTTP ${response.status}`);
   const declared = Number(response.headers.get('content-length') || 0);
   if (declared && declared > maxBytes) throw new Error(`File exceeds ${MAX_VIDEO_MB} MB limit.`);
@@ -122,55 +151,87 @@ async function telegramDownload(ctx, file, userId) {
   await downloadToFile(link.href, inputPath);
   return inputPath;
 }
-function isTransientTelegramUploadError(err) {
-  const message = String(err && (err.message || err) || '').toLowerCase();
-  return /socket hang up|econnreset|etimedout|econnrefused|ehostunreach|enotfound|network error|fetch failed|request timeout|timed out|aborted/.test(message);
-}
-
-function makeUploadSource(filePath) {
-  // Always create a fresh stream for every attempt. A consumed/destroyed stream
-  // cannot be safely reused after a network interruption.
-  return { source: fs.createReadStream(filePath), filename: safeName(path.basename(filePath)) };
-}
-
+// ---- Telegram delivery -------------------------------------------------------------
+// Files go straight to the Bot API with Node's native fetch + FormData instead of Telegraf's
+// streaming multipart. That produces an ordinary Content-Length request (the same thing
+// `curl -F video=@file.mp4` sends) rather than a chunked stream, which is what Telegram's
+// edge was dropping with "socket hang up". Every attempt builds a brand-new request.
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const UPLOAD_TIMEOUT_MS = Number(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS || 10 * 60 * 1000);
+const UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024;
+
+async function telegramUploadOnce(method, field, filePath, params) {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') form.append(key, String(value));
+  }
+  const bytes = await fs.promises.readFile(filePath);
+  form.append(field, new Blob([bytes], { type: 'video/mp4' }), safeName(path.basename(filePath)));
+
+  let response;
+  try {
+    response = await fetch(`${TELEGRAM_API_ROOT}/bot${BOT_TOKEN}/${method}`, {
+      method: 'POST', body: form, signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const detail = err && err.cause ? (err.cause.code || err.cause.message) : (err && err.name);
+    const dropped = new Error(`connection to Telegram dropped during ${method}${detail ? ` (${scrub(detail)})` : ''}`);
+    dropped.transient = true;
+    throw dropped;
+  }
+  let data = null;
+  try { data = await response.json(); } catch (_) {}
+  if (response.ok && data && data.ok) return data.result;
+
+  const rejected = new Error(`Telegram rejected ${method}: ${scrub((data && data.description) || `HTTP ${response.status}`)}`);
+  rejected.status = response.status;
+  rejected.retryAfter = data && data.parameters ? Number(data.parameters.retry_after) || 0 : 0;
+  rejected.transient = response.status === 429 || response.status >= 500;
+  throw rejected;
+}
+
+async function telegramUpload(method, field, filePath, params, maxAttempts = 4) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await telegramUploadOnce(method, field, filePath, params);
+      return { attempts: attempt };
+    } catch (err) {
+      lastError = err;
+      if (!err.transient || attempt === maxAttempts) break;
+      const waitMs = err.retryAfter ? err.retryAfter * 1000 + 500 : attempt * 2500;
+      console.warn(`[telegram] ${method} attempt ${attempt}/${maxAttempts} failed (${err.message}); retrying in ${Math.round(waitMs / 1000)}s`);
+      await sleep(waitMs);
+    }
+  }
+  lastError.attempts = maxAttempts;
+  throw lastError;
+}
 
 async function sendVideoFile(ctx, filePath, caption) {
   const size = fs.statSync(filePath).size;
   if (!size) throw new Error('The processed output file is empty.');
-  if (size > 49 * 1024 * 1024) {
+  if (size > UPLOAD_LIMIT_BYTES) {
     throw new Error(`Processed video is ${(size / 1048576).toFixed(1)} MB, above this bot's 49 MB upload safety limit.`);
   }
+  const base = { chat_id: ctx.chat.id, caption: String(caption || '').slice(0, 900) };
 
-  const options = { caption: String(caption || '').slice(0, 900), supports_streaming: true };
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const source = makeUploadSource(filePath);
-    try {
-      await ctx.telegram.sendVideo(ctx.chat.id, source, options);
-      return { sentAs: 'video', attempts: attempt };
-    } catch (err) {
-      lastError = err;
-      if (source.source && !source.source.destroyed) source.source.destroy();
-      if (!isTransientTelegramUploadError(err) || attempt === 3) break;
-      console.warn(`[telegram] sendVideo attempt ${attempt}/3 failed; retrying:`, err.message);
-      await sleep(attempt * 2000);
-    }
-  }
+  let videoError;
+  try {
+    const sent = await telegramUpload('sendVideo', 'video', filePath, { ...base, supports_streaming: true });
+    return { sentAs: 'video', attempts: sent.attempts };
+  } catch (err) { videoError = err; }
 
-  // If Telegram's video endpoint repeatedly drops the connection, try one
-  // document upload as a delivery fallback. The MP4 remains unchanged.
-  if (lastError && isTransientTelegramUploadError(lastError)) {
-    const source = makeUploadSource(filePath);
-    try {
-      await ctx.telegram.sendDocument(ctx.chat.id, source, { caption: options.caption });
-      return { sentAs: 'document_fallback', attempts: 4 };
-    } catch (fallbackError) {
-      if (source.source && !source.source.destroyed) source.source.destroy();
-      throw new Error(`Telegram could not receive the processed video after 3 video attempts and a document fallback. Last video error: ${lastError.message}. Document fallback error: ${fallbackError.message}`);
-    }
+  // Bad token / blocked bot / file too large cannot be fixed by sending it another way.
+  if (!videoError.transient && videoError.status !== 400) throw new Error(videoError.message);
+
+  // Last resort: deliver the unchanged MP4 as a document.
+  try {
+    const sent = await telegramUpload('sendDocument', 'document', filePath, base);
+    return { sentAs: 'document_fallback', attempts: (videoError.attempts || 1) + sent.attempts };
+  } catch (docError) {
+    throw new Error(`Telegram could not receive the processed video. Video upload: ${videoError.message}. Document upload: ${docError.message}`);
   }
-  throw new Error(`Telegram video upload failed: ${lastError ? lastError.message : 'unknown upload error'}`);
 }
 
 // Kuronai upload protocol copied from inject.js:
@@ -246,17 +307,21 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   let fileId;
   let lastPercent = null;
   let lastStage = 'Uploading';
-  const timer = setInterval(() => {
-    const pct = lastPercent === null ? 'Waiting for server progress' : `${lastPercent}%`;
-    editProgress(ctx, status.message_id, `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`).catch(() => {});
-  }, 3000);
+  let processing = true;                 // flips to false the moment the server job is finished
+  let inflight = Promise.resolve();      // the last status edit that may still be travelling to Telegram
+  const progressText = (pct) => `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`;
+  const showProgress = (pct) => { if (processing) inflight = editProgress(ctx, status.message_id, progressText(pct)).catch(() => {}); };
+  // Stop live progress for good BEFORE the download / Telegram-upload phases. Previously this timer kept
+  // running until the very end and re-wrote "Server encoding … Stage: patching" over the "Sending…" message.
+  const stopProgress = async () => { processing = false; clearInterval(timer); await inflight; };
+  const timer = setInterval(() => showProgress(lastPercent === null ? 'Waiting for server progress' : `${lastPercent}%`), 3000);
   try {
     fileId = await kuronaiUpload(pending.inputPath, ctx.from.id, route, encodeVideo, (event) => {
       if (Number.isFinite(Number(event.percent))) lastPercent = Math.max(0, Math.min(100, Math.round(Number(event.percent))));
       if (event.stage || event.step) lastStage = String(event.stage || event.step).slice(0, 50);
-      const pct = lastPercent === null ? 'Server working' : `${lastPercent}%`;
-      editProgress(ctx, status.message_id, `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`).catch(() => {});
+      showProgress(lastPercent === null ? 'Server working' : `${lastPercent}%`);
     });
+    await stopProgress();
     await editProgress(ctx, status.message_id, `⬇️ ${title}\nServer processing complete. Downloading result…\nElapsed: ${fmtTime(Date.now() - started)}`, true);
     const outputPath = tempPath(ctx.from.id, enhanced ? 'enhanced_result' : 'jarvis_result', '.mp4');
     await kuronaiDownload(fileId, outputPath, (percent) => {
@@ -269,10 +334,11 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     await editProgress(ctx, status.message_id, `✅ ${title} completed\nElapsed: ${fmtTime(Date.now() - started)}${deliveryNote}`, true);
     pendingVideos.delete(ctx.from.id);
   } catch (err) {
-    await editProgress(ctx, status.message_id, `❌ ${title} delivery failed\n${String(err.message || err).slice(0, 1200)}\n\nYour original video is still available. Please try again later.`, true);
+    await stopProgress();
+    await editProgress(ctx, status.message_id, `❌ ${title} delivery failed\n${scrub(err.message || err).slice(0, 1200)}\n\nYour original video is still available. Please try again later.`, true);
     throw err;
   } finally {
-    clearInterval(timer);
+    processing = false; clearInterval(timer);
     if (fileId) await kuronaiCleanup(fileId);
   }
 }
@@ -296,7 +362,7 @@ async function runLocalMethod(ctx, pending, methodKey, options = {}) {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, '✅ Processing complete.');
     pendingVideos.delete(userId);
   } catch (err) {
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Processing failed: ${err.message}`).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Processing failed: ${scrub(err.message)}`).catch(() => {});
     throw err;
   } finally { await fs.promises.unlink(outputPath).catch(() => {}); }
 }
@@ -363,7 +429,7 @@ bot.on(['video', 'document'], async (ctx) => {
     pendingVideos.set(ctx.from.id, { inputPath, fileName: safeName(file.file_name || 'video.mp4') });
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, '✅ Video received. Choose a method:', mainKeyboard());
   } catch (err) {
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Download failed: ${err.message}`).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Download failed: ${scrub(err.message)}`).catch(() => {});
   }
 });
 
@@ -385,16 +451,20 @@ async function getPending(ctx) {
   }
   return p;
 }
-async function withBusy(ctx, fn) {
+function withBusy(ctx, fn) {
   const id = ctx.from.id;
-  if (busyUsers.has(id)) { await ctx.reply('⏳ You already have a processing task running.'); return; }
+  if (busyUsers.has(id)) return ctx.reply('⏳ You already have a processing task running.');
   busyUsers.add(id);
-  try { await fn(); } catch (err) {
-    ctx.__errorReported = true;
-    console.error('[task] Operation failed:', err);
-    await ctx.reply(`❌ ${err.message || 'Operation failed.'}`).catch(() => {});
-  }
-  finally { busyUsers.delete(id); }
+  // Run the job in the background and return immediately. Processing takes minutes; if the webhook
+  // handler stayed open that long Telegraf would time it out (90 s) and print "Something went wrong"
+  // while the job was still working. The job reports its own success or failure to the user.
+  (async () => {
+    try { await fn(); }
+    catch (err) {
+      console.error('[task] Operation failed:', scrub(err && err.stack || err));
+      await ctx.reply(`❌ ${scrub(err && err.message || 'Operation failed.')}`).catch(() => {});
+    } finally { busyUsers.delete(id); }
+  })();
 }
 bot.action('method:enhanced', async (ctx) => {
   await ctx.answerCbQuery();
@@ -420,32 +490,65 @@ function validTikTokUrl(value) {
 }
 function pick(...values) { return values.find(v => v !== undefined && v !== null && v !== ''); }
 function prettyNum(v) { return v == null ? 'Unavailable' : Number(v).toLocaleString('en-US'); }
+// One TikWM call: browser-like headers, every configured host, and a log line that says WHY it failed.
+async function tikwmRequest(apiPath, init = {}) {
+  let lastStatus = 0, lastError = null;
+  for (const host of TIKWM_HOSTS) {
+    try {
+      const response = await fetch(host + apiPath, {
+        ...init,
+        headers: { ...BROWSER_HEADERS, Accept: 'application/json, text/plain, */*', ...(init.headers || {}) },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (response.ok) return response;
+      lastStatus = response.status;
+      const snippet = (await response.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 160);
+      console.warn(`[tikwm] ${host}${apiPath.split('?')[0]} -> HTTP ${response.status} ${snippet}`);
+    } catch (err) {
+      lastError = err;
+      console.warn(`[tikwm] ${host}${apiPath.split('?')[0]} -> ${err.name}: ${err.message}`);
+    }
+  }
+  if (lastStatus === 403 || lastStatus === 429) {
+    throw new Error(`TikWM is blocking requests from this server right now (HTTP ${lastStatus}). Please try again in a minute.`);
+  }
+  throw new Error(lastStatus ? `TikWM returned HTTP ${lastStatus}` : `Could not reach TikWM (${lastError ? lastError.message : 'no response'})`);
+}
+async function tikwmJson(response) {
+  try { return await response.json(); }
+  catch (_) { throw new Error('TikWM returned a web page instead of data (bot protection). Please try again in a minute.'); }
+}
+function absTikwm(link) {
+  if (!link) return null;
+  return /^https?:\/\//i.test(link) ? link : TIKWM_HOSTS[0] + (link.startsWith('/') ? link : '/' + link);
+}
 async function tikwmCheck(url) {
-  const response = await fetch(TIKWM_API + '?url=' + encodeURIComponent(url), { headers: { Accept: 'application/json' } });
-  if (!response.ok) throw new Error(`TikWM returned HTTP ${response.status}`);
-  const payload = await response.json();
-  if (payload.code !== 0 || !payload.data) throw new Error(payload.msg || 'TikTok video could not be retrieved.');
-  return payload.data;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const response = await tikwmRequest('/api/?url=' + encodeURIComponent(url));
+    const payload = await tikwmJson(response);
+    if (payload.code === 0 && payload.data) return payload.data;
+    // TikWM's free tier allows 1 request/second; wait once and retry.
+    if (attempt === 1 && /limit|1 request/i.test(payload.msg || '')) { await sleep(1300); continue; }
+    throw new Error(payload.msg || 'TikTok video could not be retrieved.');
+  }
 }
 async function tikwmOriginal(url) {
-  const submit = await fetch('https://www.tikwm.com/api/video/task/submit', {
+  const submit = await tikwmRequest('/api/video/task/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'X-Requested-With': 'XMLHttpRequest', Referer: 'https://www.tikwm.com/originalDownloader.html' },
     body: 'url=' + encodeURIComponent(url) + '&web=1'
   });
-  if (!submit.ok) throw new Error(`Original downloader returned HTTP ${submit.status}`);
-  const payload = await submit.json();
+  const payload = await tikwmJson(submit);
   const taskId = payload && payload.data && payload.data.task_id;
   if (payload.code !== 0 || !taskId) throw new Error(payload.msg || 'Could not start original-quality task.');
   for (let i = 0; i < 15; i++) {
-    await new Promise(r => setTimeout(r, 2000));
-    const response = await fetch('https://www.tikwm.com/api/video/task/result?task_id=' + encodeURIComponent(taskId));
-    if (!response.ok) continue;
-    const result = await response.json();
+    await sleep(2000);
+    let result;
+    try { result = await tikwmJson(await tikwmRequest('/api/video/task/result?task_id=' + encodeURIComponent(taskId))); } catch (_) { continue; }
     if (result.code === 0 && result.data) {
       const d = result.data.detail || result.data;
       const link = d.play_url || d.download_url || d.play;
-      if (link) return link;
+      if (link) return absTikwm(link);
       if (['failed', 'error'].includes(result.data.status)) throw new Error('Provider could not create the original file.');
     }
   }
@@ -472,8 +575,8 @@ async function processTikTokUrl(ctx, url) {
     const author = d.author || {};
     const stats = d.statistics || d.stats || {};
     const region = pick(d.region, d.region_code, d.created_region, 'Not provided by TikWM');
-    const standard = d.play || d.wmplay || d.hdplay || null;
-    const hd = d.hdplay || null;
+    const standard = absTikwm(d.play || d.wmplay || d.hdplay);
+    const hd = absTikwm(d.hdplay);
     const info = [
       '✅ TIKTOK VIDEO FOUND',
       `Title: ${pick(d.title, 'TikTok video')}`,
@@ -504,7 +607,7 @@ async function processTikTokUrl(ctx, url) {
     pendingVideos.set(ctx.from.id, { ...(pendingVideos.get(ctx.from.id) || {}), tiktokUrl: url, tiktokData: d });
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, info, Markup.inlineKeyboard(buttons));
   } catch (err) {
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ TikTok check failed: ${err.message}`).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ TikTok check failed: ${scrub(err.message)}`).catch(() => {});
   }
 }
 bot.action('tiktok:original', async (ctx) => {
@@ -513,7 +616,7 @@ bot.action('tiktok:original', async (ctx) => {
     const p = pendingVideos.get(ctx.from.id); if (!p || !p.tiktokUrl) return ctx.reply('Send a TikTok URL using Checker & Downloader first.');
     const msg = await ctx.reply('⭐ Requesting original/highest available quality…');
     try { const url = await tikwmOriginal(p.tiktokUrl); await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, '✅ Original/highest-quality download link is ready:', Markup.inlineKeyboard([[Markup.button.url('⬇️ Download Original', url)]])); }
-    catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ Original download failed: ${err.message}`).catch(() => {}); }
+    catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ Original download failed: ${scrub(err.message)}`).catch(() => {}); }
   });
 });
 bot.action('tiktok:inspect', async (ctx) => {
@@ -521,7 +624,7 @@ bot.action('tiktok:inspect', async (ctx) => {
   return withBusy(ctx, async () => {
     const p = pendingVideos.get(ctx.from.id); const d = p && p.tiktokData;
     if (!d) return ctx.reply('Check a TikTok URL first.');
-    const direct = d.play || d.wmplay || d.hdplay;
+    const direct = absTikwm(d.play || d.wmplay || d.hdplay);
     if (!direct) return ctx.reply('TikWM did not return a standard downloadable video URL.');
     const msg = await ctx.reply('⬇️ Downloading standard video for native FFmpeg/FFprobe inspection…');
     const filePath = tempPath(ctx.from.id, 'tiktok_inspect', '.mp4');
@@ -542,7 +645,7 @@ bot.action('tiktok:inspect', async (ctx) => {
         '', 'Note: These are details of the downloaded stream, not a guaranteed inventory of every server-side TikTok rendition.'
       ].join('\n');
       await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, lines);
-    } catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ FFmpeg inspection failed: ${err.message}`).catch(() => {}); }
+    } catch (err) { await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, `❌ FFmpeg inspection failed: ${scrub(err.message)}`).catch(() => {}); }
     finally { await fs.promises.unlink(filePath).catch(() => {}); }
   });
 });
@@ -560,7 +663,7 @@ bot.on('text', async (ctx) => {
 });
 
 bot.catch((err, ctx) => {
-  console.error('Bot error:', err);
+  console.error('Bot error:', scrub(err && err.stack || err));
   if (ctx && !ctx.__errorReported) ctx.reply('❌ Something went wrong. Please try again.').catch(() => {});
 });
 
