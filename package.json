@@ -1,3 +1,4 @@
+
 {
   "name": "jv-methods-bot",
   "version": "2.0.0",
@@ -5,7 +6,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "postinstall": "python3 -m venv .venv && .venv/bin/pip install --upgrade pip yt-dlp"
+    "postinstall": "python3 -m venv .venv && .venv/bin/python -m pip install --upgrade pip yt-dlp"
   },
   "engines": {
     "node": ">=18.0.0"
