@@ -3,13 +3,8 @@
   "version": "2.0.0",
   "private": true,
   "main": "bot.js",
-  "scripts": {
-    "start": "node bot.js",
-    "postinstall": "python3 -m venv .venv && .venv/bin/pip install --upgrade pip yt-dlp"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "scripts": { "start": "node bot.js" },
+  "engines": { "node": ">=18.0.0" },
   "dependencies": {
     "telegraf": "^4.16.3",
     "express": "^4.19.2",
