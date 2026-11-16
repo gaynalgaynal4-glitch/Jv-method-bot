@@ -1,50 +1,58 @@
-# JV Methods Bot v2.0
+# JV Methods Bot v2.1
+
+A Telegraf webhook bot with a separate GramJS MTProto media-transfer client. Existing processing methods and the TikTok checker UI are retained.
 
 ## Features
-- **Enhanced Method**: Kuronai `POST https://api.kuronaiapp.com/uploaden/`.
-- **HD Method**: Luna (the original MP4Patcher adapter) or Jarvis HQ (`POST /upload/`).
-- **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
-- **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
-- **FFmpeg Method**: original timestamp-scaling method, with 30/60 FPS selection.
-- **Checker & Downloader**: self-hosted yt-dlp metadata and TikTok downloads, plus native FFprobe inspection of the downloaded stream.
 
-## Deploy
-1. Deploy as a Render Web Service.
-2. For Render's **Node** runtime, use Node.js 18 or newer and set this Build Command:
-   `npm install && python3 -m venv .venv && .venv/bin/pip install --upgrade pip yt-dlp`
-3. Set Start Command to `npm start`.
-4. Set `BOT_TOKEN` in Render Environment.
-5. Render normally supplies `RENDER_EXTERNAL_URL` automatically. You can optionally set `WEBHOOK_SECRET`, `MAX_VIDEO_MB`, `FFMPEG_PATH`, and `FFPROBE_PATH`.
-6. The bot automatically uses `.venv/bin/yt-dlp` when that file exists. You can override it with `YTDLP_PATH` if needed.
+- `/start` and `/help`, existing inline menus and callbacks.
+- Enhanced Method using Kuronai `/uploaden/`.
+- Luna using the original `methods/c_method.js` MP4Patcher adapter.
+- Jarvis HQ using Kuronai `/upload/`, preserving optimizer ON/OFF.
+- FFmpeg method using the original timestamp-scaling implementation and 30/60 FPS options.
+- TikTok Checker & Downloader using server-side `yt-dlp`; TikWM is not used.
+- One configurable maximum video size, defaulting to 200 MB, checked on incoming media, processing inputs/outputs, TikTok downloads, Kuronai outputs and Telegram uploads.
+- GramJS MTProto media transfer for incoming message downloads and outgoing video uploads. Telegraf remains responsible for commands, callbacks, webhook updates and the health endpoint.
 
-If you deploy using the included Dockerfile instead, it installs yt-dlp into `/opt/yt-dlp-venv` and configures `YTDLP_PATH` automatically. Do not use a Node build command with a Docker runtime.
+## Render deployment (recommended: Docker)
 
-## Important behavior and limitations
-- The bot sends the Telegram user ID as `tg_id`, matching the extension's upload request. It does not hardcode one person's ID.
-- Jarvis ON sends `encode_video=true`; OFF sends `encode_video=false` to `/upload/`.
-- The extension's `/uploaden/` route is used for Enhanced and does not send `encode_video`.
-- Actual server encoding percentages are displayed only when the server emits a numeric `percent` in its NDJSON `progress` events. The elapsed timer continues independently.
-- The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html` as a reference asset. The active Telegram TikTok checker uses yt-dlp, not the HTML's former downloader API.
-- FFprobe inspects the downloaded rendition only; it cannot discover all private/server-side TikTok variants.
-- The original Luna and FFmpeg method source files are retained.
+Create a Render **Web Service** connected to the repository.
 
+- **Runtime:** Docker
+- **Root Directory:** the directory containing this Dockerfile (repository root if the project files are at the root)
+- **Build Command:** leave blank; Render builds the Dockerfile
+- **Start Command:** leave blank; Dockerfile runs `npm start`
+- **Health Check Path:** `/`
+- **Environment:** add the variables below in Render's Environment page
 
-## TikTok checker/downloader (yt-dlp)
+Required variables:
 
-TikWM has been removed. TikTok URLs are now inspected and downloaded by `yt-dlp` running on the JV server. The bot requests JSON metadata from yt-dlp, displays fields that the extractor actually returns, and offers standard (up to 720p when available) and highest-available downloads. The inspect action downloads the highest available rendition and runs the server's FFprobe against that file.
+- `BOT_TOKEN` — bot token from BotFather
+- `API_ID` — Telegram API ID
+- `API_HASH` — Telegram API hash
+- `MAX_VIDEO_MB` — `200` (optional; 200 is the default)
+- `WEBHOOK_SECRET` — long random secret used in the webhook URL path
+- `RENDER_EXTERNAL_URL` — Render service public URL if not automatically supplied
+- `YTDLP_PATH` — `/opt/yt-dlp-venv/bin/yt-dlp` (already set in the Docker image)
 
-### Install yt-dlp
+Render supplies `PORT` automatically. Do not set a fixed production port unless you have a specific reason. The service listens on `process.env.PORT`.
 
-The included `Dockerfile` installs yt-dlp in a Python virtual environment and sets `YTDLP_PATH` automatically. For Render's native Node runtime, the build command above installs yt-dlp into the project's `.venv` directory. The bot also falls back to `python3 -m yt_dlp` if the executable cannot be found. Keep yt-dlp updated because TikTok may change its site behavior.
+The Docker image installs Python 3, a virtual environment, FFmpeg, FFprobe and yt-dlp once. Node dependencies are installed once; there is no Python `postinstall` in `package.json`. `.dockerignore` excludes `.env` from the Docker build context.
 
-Example local setup:
+## Telegram MTProto transfer
 
-```bash
-python3 -m venv .venv-ytdlp
-.venv-ytdlp/bin/pip install -U yt-dlp
-YTDLP_PATH="$PWD/.venv-ytdlp/bin/yt-dlp" npm start
-```
+GramJS authenticates as the bot account with `API_ID`, `API_HASH` and `BOT_TOKEN`. It fetches the exact message media by chat ID and message ID and writes it to disk, then sends outputs with `sendFile`. The session is held in memory and can be recreated at startup using the bot token, so no local session file is required across Render redeploys.
 
-The metadata shown is limited to what TikTok and the current yt-dlp extractor make available. Region, likes, comments, or other fields may be missing. This is self-hosted software with no paid downloader API quota, but it is not literally unlimited: server CPU, storage, bandwidth, and TikTok access controls still apply.
+The configured 200 MB limit is below Telegram's MTProto large-file upload capability. This does not change the Bot API's ordinary file limits: the code deliberately uses MTProto for the media transfer path. Telegram's server-side limits and account/API policy can still change, so a successful transfer must be confirmed in the deployed bot.
 
-**Telegram file-transfer note:** this update replaces TikWM with yt-dlp; it does not yet add MTProto. The existing Telegraf Bot API transfer path still has Telegram's standard file-size restrictions.
+## Security
+
+- Never commit `.env`; it is excluded by `.gitignore` and `.dockerignore`.
+- `.env.example` contains variable names and placeholders only.
+- GitHub does not automatically transfer a repository's local `.env` values into Render. Add each secret as a Render Environment Variable.
+- If the supplied `.env` was committed to a public/shared GitHub repository, revoke/rotate the BotFather token immediately, create replacement Telegram API credentials if the exposed application credentials can be replaced, remove `.env` from Git tracking/history, and redeploy with new Render variables. An API hash should be treated as compromised if exposed.
+
+## Notes and limitations
+
+- TikTok extraction depends on TikTok's availability to the server IP and may fail for region-restricted videos or URLs requiring cookies. The error message retains yt-dlp details.
+- The Luna MP4Patcher implementation operates on a complete MP4 byte array; unlike the Kuronai and download/upload paths, that existing algorithm is inherently memory-intensive. It was retained to avoid changing the user's processing algorithm.
+- A full Telegram transfer test requires valid live `BOT_TOKEN`, `API_ID` and `API_HASH` values and an actual Telegram chat. These credentials are not included in this project archive.
