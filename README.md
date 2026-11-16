@@ -1,55 +1,26 @@
-# JV Methods Bot — Node.js / Render edition
+# JV Methods Bot v2.0
 
-## Deploy on Render
+## Features
+- **Enhanced Method**: Kuronai `POST https://api.kuronaiapp.com/uploaden/`.
+- **HD Method**: Luna (the original MP4Patcher adapter) or Jarvis HQ (`POST /upload/`).
+- **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
+- **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
+- **FFmpeg Method**: original timestamp-scaling method, with 30/60 FPS selection.
+- **Checker & Downloader**: TikWM metadata, region field where returned, standard/HD download links, original-quality task flow, and native FFprobe inspection of the downloaded stream.
 
-1. Push this folder to a GitHub repo
-2. Render dashboard → **New → Web Service** → connect the repo
-3. **Build command:** `npm install`
-4. **Start command:** `npm start`
-5. **Environment variables:**
-   - `BOT_TOKEN` — your token from @BotFather
-   - `WEBHOOK_SECRET` — any random string (e.g. `a1b2c3d4`) — keeps your webhook URL private
-   - `RENDER_EXTERNAL_URL` — Render sets this automatically, you don't need to add it
-   - `FFMPEG_PATH` / `FFPROBE_PATH` — optional overrides; normally the bundled binaries are used
-6. Deploy. On startup the bot automatically registers its webhook with Telegram — no manual `setWebhook` call needed.
+## Deploy
+1. Use Node.js 18 or newer.
+2. Set `BOT_TOKEN` to your Telegram bot token.
+3. Set `RENDER_EXTERNAL_URL` (automatically provided by Render) or `PUBLIC_URL` to your public HTTPS service URL.
+4. Optional: set `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, `FFMPEG_PATH`, or `FFPROBE_PATH`.
+5. Run `npm install` then `npm start`.
+6. Deploy as a Render Web Service, not a static site.
 
-Add an **UptimeRobot** monitor pinging `https://your-app.onrender.com/` every 5 minutes to reduce cold-start delay — same as your other Render services.
-
-## Local testing
-
-Render sets `RENDER_EXTERNAL_URL` for you, but locally there's no public URL, so set one with a tunnel (e.g. `ngrok http 3000`) and pass it in:
-
-```bash
-npm install
-export BOT_TOKEN="123456:ABC-your-token"
-export PUBLIC_URL="https://your-ngrok-url.ngrok-free.app"
-npm start
-```
-
-## Commands
-
-The bot registers these in Telegram's `/` menu automatically on startup:
-
-| Command  | What it does                                  |
-|----------|------------------------------------------------|
-| `/start` | Greeting + quick instructions                  |
-| `/help`  | Step-by-step usage guide                        |
-
-Add more by editing the `bot.start(...)` / `bot.help(...)` handlers in `bot.js`, and adding the command to the `setMyCommands` list at the bottom of the file so it shows up in the menu.
-
-## Adding your real processing logic
-
-Each method exports an async `process(inputPath, outputPath, options)` function. Throw an `Error` on failure — the bot catches it and reports the problem.
-
-Current methods:
-- `methods/jv60fps_method.js` — FFmpeg 60 FPS re-encoding example.
-- `methods/c_method.js` — existing MP4 patcher method.
-- `methods/ffmpage_method.js` — detects source FPS, asks the user to choose 30 or 60 FPS, calculates `sourceFPS / targetFPS`, then uses FFmpeg `-itsscale` with `-c copy`. It does not re-encode the video or audio. The timestamp scale changes playback duration; it does not synthesize or discard encoded frames.
-
-`ffmpeg-static` and `ffprobe-static` are installed as npm dependencies so the ffm-page method has FFmpeg and FFprobe binaries on Render without requiring a system-level FFmpeg installation. Set `FFMPEG_PATH` or `FFPROBE_PATH` only if you want to override the bundled binaries.
-
-## Notes
-
-- **File size limit:** Telegram's public Bot API caps downloads at 20MB regardless of what `MAX_VIDEO_MB` says — raise `MAX_VIDEO_MB` only if you're running a local Bot API server.
-- **Webhook vs polling:** this bot uses webhook mode (`bot.webhookCallback`), not `bot.launch()` polling — that's what makes it work properly on Render's free tier, since a sleeping service just means Telegram waits a few seconds for the next webhook delivery instead of losing updates like polling would.
-- **FFmpeg on Render:** this project bundles FFmpeg/FFprobe through `ffmpeg-static` and `ffprobe-static` for the ffm-page method. The JV-60fps method still invokes the `ffmpeg` command from PATH; set up `FFMPEG_PATH` or update that method if you also want it to use the bundled binary.
+## Important behavior and limitations
+- The bot sends the Telegram user ID as `tg_id`, matching the extension's upload request. It does not hardcode one person's ID.
+- Jarvis ON sends `encode_video=true`; OFF sends `encode_video=false` to `/upload/`.
+- The extension's `/uploaden/` route is used for Enhanced and does not send `encode_video`.
+- Actual server encoding percentages are displayed only when the server emits a numeric `percent` in its NDJSON `progress` events. The elapsed timer continues independently.
+- The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html`; its API workflow is adapted to Telegram messages/buttons. The supplied TikWM HTML exposes `region`, creator/video metadata, standard links and an original-quality task API. It explicitly does not expose browser/phone playback quality. The country restriction reason is not provided by that API.
+- FFprobe inspects the downloaded rendition only; it cannot discover all private/server-side TikTok variants.
+- The original Luna and FFmpeg method source files are retained.
