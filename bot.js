@@ -367,13 +367,23 @@ async function runLocalMethod(ctx, pending, methodKey, options = {}) {
   } finally { await fs.promises.unlink(outputPath).catch(() => {}); }
 }
 
+// Telegram Mini App ("Checker & Downloader"). Opens inside Telegram, and its TikWM requests are made from the
+// user's own phone instead of this server. Telegram only accepts https:// addresses for Mini Apps.
+const MINI_APP_URL = (process.env.MINI_APP_URL || 'https://fastidious-biscochitos-ad7934.netlify.app/').trim();
+
 function mainKeyboard() {
-  return Markup.inlineKeyboard([
+  const rows = [
     [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
     [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
     [Markup.button.callback('🧰 FFmpeg Method', 'menu:ffmpeg')],
-    [Markup.button.callback('🔎 Checker & Downloader', 'menu:checker')],
-  ]);
+  ];
+  if (/^https:\/\//i.test(MINI_APP_URL)) {
+    rows.push([Markup.button.webApp('🔎 Checker & Downloader', MINI_APP_URL)]);
+    rows.push([Markup.button.callback('💬 Checker in chat', 'menu:checker')]);   // the original chat version stays available
+  } else {
+    rows.push([Markup.button.callback('🔎 Checker & Downloader', 'menu:checker')]);
+  }
+  return Markup.inlineKeyboard(rows);
 }
 function hdKeyboard() {
   return Markup.inlineKeyboard([
@@ -524,7 +534,8 @@ function absTikwm(link) {
 }
 async function tikwmCheck(url) {
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const response = await tikwmRequest('/api/?url=' + encodeURIComponent(url));
+    // hd=1 asks TikWM to include the HD link (hdplay); without it only the standard link comes back.
+    const response = await tikwmRequest('/api/?hd=1&url=' + encodeURIComponent(url));
     const payload = await tikwmJson(response);
     if (payload.code === 0 && payload.data) return payload.data;
     // TikWM's free tier allows 1 request/second; wait once and retry.
