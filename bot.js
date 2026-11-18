@@ -16,10 +16,7 @@ const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
 const WEBHOOK_PATH = `/webhook/${process.env.WEBHOOK_SECRET || 'jv-bot'}`;
 const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
-const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 200);
-// MTProto (GramJS). Get API_ID / API_HASH from https://my.telegram.org -> API development tools.
-const API_ID = Number(process.env.API_ID || 0);
-const API_HASH = process.env.API_HASH || '';
+const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 50);
 // Required-channel gate. The bot must be an administrator in this channel
 // so Telegram can reliably return membership status for other users.
 const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || '@jv_60fps';
@@ -60,7 +57,7 @@ const bot = new Telegraf(BOT_TOKEN, {
   // Long jobs now run in the background (see withBusy), but never let Telegraf abort a handler at its 90 s default.
   handlerTimeout: 30 * 60 * 1000,
   // Fresh connection per API call: a pooled keep-alive socket that Telegram already closed is a classic "socket hang up".
-  telegram: { agent: new https.Agent({ keepAlive: false }) },
+  telegram: { agent: new https.Agent({ keepAlive: false }), apiRoot: TELEGRAM_API_ROOT },
 });
 const pendingVideos = new Map();
 const busyUsers = new Set();
@@ -150,11 +147,10 @@ async function downloadToFile(url, destPath, maxBytes = MAX_VIDEO_MB * 1024 * 10
 async function telegramDownload(ctx, file, userId) {
   const ext = path.extname(file.file_name || '') || '.mp4';
   const inputPath = tempPath(userId, 'input', ext);
-  // The Bot API only serves files up to 20 MB; bigger ones come through MTProto.
-  if ((file.file_size || 0) > 20 * 1048576) {
-    if (!mtReady) throw new Error('Videos above 20 MB need MTProto: set API_ID and API_HASH on Render.');
-    return mtDownload(ctx, inputPath);
-  }
+  if (!SELF_HOSTED && (file.file_size || 0) > 20 * 1048576) throw new Error('Telegram only lets bots download videos up to 20 MB. Send a smaller video.');
+  const info = await ctx.telegram.getFile(file.file_id);
+  // A local-mode Bot API server returns an absolute path on its own disk.
+  if (info.file_path && path.isAbsolute(info.file_path)) { await fs.promises.copyFile(info.file_path, inputPath); return inputPath; }
   const link = await ctx.telegram.getFileLink(file.file_id);
   await downloadToFile(link.href, inputPath);
   return inputPath;
@@ -166,8 +162,9 @@ async function telegramDownload(ctx, file, userId) {
 // edge was dropping with "socket hang up". Every attempt builds a brand-new request.
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const UPLOAD_TIMEOUT_MS = Number(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS || 10 * 60 * 1000);
-const BOTAPI_LIMIT_BYTES = 49 * 1024 * 1024;       // plain Bot API ceiling
-const MAX_UPLOAD_BYTES = MAX_VIDEO_MB * 1048576;   // MTProto ceiling (default 200 MB)
+// Public Bot API: 49 MB uploads / 20 MB downloads. A self-hosted Bot API server (TELEGRAM_API_ROOT) lifts both to MAX_VIDEO_MB.
+const SELF_HOSTED = TELEGRAM_API_ROOT !== 'https://api.telegram.org';
+const MAX_UPLOAD_BYTES = (SELF_HOSTED ? MAX_VIDEO_MB : Math.min(MAX_VIDEO_MB, 49)) * 1048576;
 
 async function telegramUploadOnce(method, field, filePath, params) {
   const form = new FormData();
@@ -220,16 +217,7 @@ async function telegramUpload(method, field, filePath, params, maxAttempts = 4) 
 async function sendVideoFile(ctx, filePath, caption) {
   const size = fs.statSync(filePath).size;
   if (!size) throw new Error('The processed output file is empty.');
-  if (size > MAX_UPLOAD_BYTES) throw new Error(`Processed video is ${(size / 1048576).toFixed(1)} MB, above the ${MAX_VIDEO_MB} MB limit.`);
-  if (mtReady) {
-    try { await mtSend(ctx, filePath, caption); return { sentAs: 'video', attempts: 1 }; }
-    catch (e) {
-      console.warn('[mtproto] upload failed:', scrub(e.message));
-      if (size > BOTAPI_LIMIT_BYTES) throw new Error(`MTProto upload failed: ${scrub(e.message)}`);
-    }
-  } else if (size > BOTAPI_LIMIT_BYTES) {
-    throw new Error(`Video is ${(size / 1048576).toFixed(1)} MB. Files above 49 MB need MTProto: set API_ID and API_HASH on Render.`);
-  }
+  if (size > MAX_UPLOAD_BYTES) throw new Error(`Processed video is ${(size / 1048576).toFixed(1)} MB, above this bot's ${Math.round(MAX_UPLOAD_BYTES / 1048576)} MB upload limit.`);
   const base = { chat_id: ctx.chat.id, caption: String(caption || '').slice(0, 900) };
 
   let videoError;
@@ -248,52 +236,6 @@ async function sendVideoFile(ctx, filePath, caption) {
   } catch (docError) {
     throw new Error(`Telegram could not receive the processed video. Video upload: ${videoError.message}. Document upload: ${docError.message}`);
   }
-}
-
-// ---- MTProto (GramJS): large uploads/downloads up to MAX_VIDEO_MB -----------------------
-let mt = null, mtReady = false, Api = null, CustomFile = null;
-async function startMtproto() {
-  if (!API_ID || !API_HASH) { console.warn('[mtproto] API_ID / API_HASH missing: limited to the 49 MB Bot API.'); return; }
-  const { TelegramClient } = require('telegram');
-  const { StringSession } = require('telegram/sessions');
-  const { NewMessage } = require('telegram/events');
-  ({ Api } = require('telegram'));
-  ({ CustomFile } = require('telegram/client/uploads'));
-  mt = new TelegramClient(new StringSession(''), API_ID, API_HASH, { connectionRetries: 5 });
-  await mt.start({ botAuthToken: BOT_TOKEN });
-  // Receiving updates is what lets GramJS learn each user's access hash (needed to message them).
-  mt.addEventHandler(() => {}, new NewMessage({ incoming: true }));
-  mtReady = true;
-  console.log('[mtproto] Connected.');
-}
-async function mtDownload(ctx, outPath) {
-  let msg = null;
-  for (let i = 0; i < 6 && !(msg && msg.media); i++) {
-    try { [msg] = await mt.getMessages(ctx.chat.id, { ids: [ctx.message.message_id] }); } catch (_) {}
-    if (!(msg && msg.media)) await sleep(1000);
-  }
-  if (!msg || !msg.media) throw new Error('MTProto could not find that message. Please send the video again.');
-  await mt.downloadMedia(msg, { outputFile: outPath });
-  return outPath;
-}
-async function mtSend(ctx, filePath, caption) {
-  let w, h, duration;
-  try {
-    const meta = await inspectMedia(filePath); const st = (meta.streams || [])[0] || {};
-    w = st.width; h = st.height; duration = Math.round(Number((meta.format || {}).duration) || 0);
-  } catch (_) {}
-  const size = fs.statSync(filePath).size;
-  let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      return await mt.sendFile(ctx.chat.id, {
-        file: new CustomFile(safeName(path.basename(filePath)), size, filePath),
-        caption: String(caption || '').slice(0, 900), forceDocument: false, supportsStreaming: true, workers: 4,
-        attributes: [new Api.DocumentAttributeVideo({ duration: duration || 0, w: w || 0, h: h || 0, supportsStreaming: true })],
-      });
-    } catch (e) { lastErr = e; await sleep(attempt * 2500); }
-  }
-  throw lastErr;
 }
 
 // Kuronai upload protocol copied from inject.js:
@@ -595,5 +537,4 @@ app.listen(PORT, '0.0.0.0', async () => {
     try { await bot.telegram.callApi('setChatMenuButton', { menu_button: { type: 'web_app', text: 'Checker', web_app: { url: MINI_APP_URL } } }); }
     catch (err) { console.error('[bot] Menu button failed:', scrub(err.message)); }
   }
-  startMtproto().catch(err => console.error('[mtproto] Start failed:', scrub(err.message)));
 });
