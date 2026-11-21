@@ -35,7 +35,6 @@ const BROWSER_HEADERS = {
   Origin: 'https://www.tikwm.com',
   Referer: 'https://www.tikwm.com/',
 };
-const FFMPEG = process.env.FFMPEG_PATH || (require('ffmpeg-static') || 'ffmpeg');
 const FFPROBE_PKG = require('ffprobe-static');
 const FFPROBE = process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
 
@@ -100,8 +99,14 @@ const METHODS = {
   enhanced: { label: '🟢 Enhanced Method', route: '/uploaden/' },
   luna: { label: '🌙 Luna (MP4Patcher)' },
   jarvis: { label: '⚠️ Jarvis (Kuronai HQ)' },
-  ffmpeg: { label: '🧰 FFmpeg Method' },
+  alpha: { label: '⚡ Alpha' },
 };
+const XORA_API = 'https://api.xora.sh/v1';
+const XORA_API_KEY = process.env.XORA_API_KEY || '';
+const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '18M';
+const ALPHA_AUDIO_BITRATE = process.env.ALPHA_AUDIO_BITRATE || '128k';
+const ALPHA_JOB_TIMEOUT_MS = Number(process.env.ALPHA_JOB_TIMEOUT_MS || 15 * 60 * 1000);
+const alphaInputTokens = new Map();
 
 function userDir(userId) {
   const dir = path.join(WORK_DIR, String(userId));
@@ -172,7 +177,7 @@ async function telegramUploadOnce(method, field, filePath, params) {
     if (value !== undefined && value !== null && value !== '') form.append(key, String(value));
   }
   const bytes = await fs.promises.readFile(filePath);
-  form.append(field, new Blob([bytes], { type: 'video/mp4' }), safeName(path.basename(filePath)));
+  form.append(field, new Blob([bytes], { type: field === 'video' ? 'video/mp4' : 'application/octet-stream' }), safeName(path.basename(filePath)));
 
   let response;
   try {
@@ -236,6 +241,16 @@ async function sendVideoFile(ctx, filePath, caption) {
   } catch (docError) {
     throw new Error(`Telegram could not receive the processed video. Video upload: ${videoError.message}. Document upload: ${docError.message}`);
   }
+}
+
+async function sendDocumentFile(ctx, filePath, caption) {
+  const size = fs.statSync(filePath).size;
+  if (!size) throw new Error('The processed output file is empty.');
+  if (size > MAX_UPLOAD_BYTES) throw new Error(`Processed video is ${(size / 1048576).toFixed(1)} MB, above this bot's ${Math.round(MAX_UPLOAD_BYTES / 1048576)} MB upload limit.`);
+  await telegramUpload('sendDocument', 'document', filePath, {
+    chat_id: ctx.chat.id,
+    caption: String(caption || '').slice(0, 900),
+  });
 }
 
 // Kuronai upload protocol copied from inject.js:
@@ -347,28 +362,148 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   }
 }
 
-async function runLocalMethod(ctx, pending, methodKey, options = {}) {
+async function runLocalMethod(ctx, pending, methodKey) {
   const userId = ctx.from.id;
   const outputPath = tempPath(userId, `out_${methodKey}`, path.extname(pending.inputPath) || '.mp4');
-  const status = await ctx.reply(`⚙️ Processing with ${methodKey === 'luna' ? 'Luna (MP4Patcher)' : 'FFmpeg'}…`);
+  const status = await ctx.reply('⚙️ Processing with Luna…');
   try {
-    const moduleFile = methodKey === 'luna' ? 'c_method.js' : 'ffmpage_method.js';
-    const mod = loadMethod(moduleFile);
-    let result;
-    if (methodKey === 'ffmpeg') result = await mod.process(pending.inputPath, outputPath, options);
-    else await mod.process(pending.inputPath, outputPath);
+    const mod = loadMethod('c_method.js');
+    await mod.process(pending.inputPath, outputPath);
     if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) throw new Error('The method did not produce a valid output file.');
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, '📤 Uploading processed video…');
-    const caption = methodKey === 'ffmpeg'
-      ? `✅ FFmpeg method completed\nSource FPS: ${result.sourceFps.toFixed(3)}\nSelected FPS: ${result.targetFps}\nTimestamp scale: ${result.scaleFactor.toFixed(4)}x\nMode: stream copy (no re-encoding)`
-      : '✅ Luna MP4Patcher completed';
-    await sendVideoFile(ctx, outputPath, caption);
+    await sendVideoFile(ctx, outputPath, '✅ Luna MP4Patcher completed');
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, '✅ Processing complete.');
     pendingVideos.delete(userId);
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Processing failed: ${scrub(err.message)}`).catch(() => {});
     throw err;
   } finally { await fs.promises.unlink(outputPath).catch(() => {}); }
+}
+
+function parseFps(value) {
+  if (!value || value === '0/0' || value === 'N/A') return NaN;
+  const parts = String(value).split('/');
+  const n = Number(parts[0]);
+  const d = parts.length > 1 ? Number(parts[1]) : 1;
+  return Number.isFinite(n) && Number.isFinite(d) && d > 0 ? n / d : NaN;
+}
+
+function alphaEstimate(meta, targetFps) {
+  const stream = (meta.streams || [])[0];
+  if (!stream) throw new Error('No video stream was found in this file.');
+  const sourceFps = parseFps(stream.avg_frame_rate) || parseFps(stream.r_frame_rate);
+  const duration = Number(meta.format && meta.format.duration);
+  if (!Number.isFinite(sourceFps) || sourceFps <= 0) throw new Error('Could not detect the source FPS.');
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('Could not detect the video duration.');
+  const scaleFactor = targetFps ? sourceFps / targetFps : 1;
+  const outputDuration = duration * scaleFactor;
+  const videoBps = Number(String(ALPHA_VIDEO_BITRATE).replace(/k$/i, '000').replace(/m$/i, '000000')) || 18000000;
+  const audioBps = Number(String(ALPHA_AUDIO_BITRATE).replace(/k$/i, '000').replace(/m$/i, '000000')) || 128000;
+  const estimatedMB = ((videoBps + audioBps) * outputDuration / 8) / 1048576;
+  return { sourceFps, duration, scaleFactor, outputDuration, estimatedMB };
+}
+
+async function xoraRequest(route, options = {}) {
+  if (!XORA_API_KEY) throw new Error('Alpha is not configured yet. Please contact the bot administrator.');
+  const response = await fetch(`${XORA_API}${route}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${XORA_API_KEY}`, ...(options.headers || {}) },
+    signal: options.signal || AbortSignal.timeout(120000),
+  });
+  const raw = await response.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) { data = { message: raw.slice(0, 500) }; }
+  if (!response.ok) {
+    const detail = data.error && (data.error.message || data.error.code) || data.message || data.detail || `HTTP ${response.status}`;
+    throw new Error(`Alpha request failed: ${detail}`);
+  }
+  return data;
+}
+
+async function createAlphaJob(inputPath, targetFps, estimate, onProgress) {
+  if (!PUBLIC_URL || !/^https:\/\//i.test(PUBLIC_URL)) throw new Error('Alpha needs RENDER_EXTERNAL_URL or PUBLIC_URL set to this bot’s public HTTPS address.');
+  const token = crypto.randomBytes(24).toString('hex');
+  alphaInputTokens.set(token, { path: inputPath, expiresAt: Date.now() + 60 * 60 * 1000 });
+  const inputUrl = `${PUBLIC_URL.replace(/\/$/, '')}/alpha-input/${token}`;
+  const outputName = `alpha_${Date.now()}.wmv`;
+  const args = [];
+  if (targetFps) args.push('-itsscale', estimate.scaleFactor.toFixed(10));
+  args.push(
+    '-i', '{{input}}',
+    '-map', '0:v:0', '-map', '0:a?',
+    '-vf', 'scale=-2:720:flags=lanczos',
+    '-c:v', 'wmv2', '-b:v', ALPHA_VIDEO_BITRATE,
+    '-maxrate', '20M', '-bufsize', '36M',
+    '-c:a', 'wmav2', '-b:a', ALPHA_AUDIO_BITRATE,
+    '-f', 'asf', '{{output}}'
+  );
+  const created = await xoraRequest('/jobs', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mode: 'ffmpeg',
+      input_files: { in_1: inputUrl },
+      output_files: { out_1: outputName },
+      ffmpeg: { args: args.map((arg) => arg === '{{input}}' ? '{{in_1}}' : arg === '{{output}}' ? '{{out_1}}' : arg) },
+      idempotencyKey: `alpha-${crypto.randomUUID()}`,
+    }),
+  });
+  const jobId = created.id || created.jobId;
+  if (!jobId) throw new Error('Alpha did not return a job ID.');
+
+  const started = Date.now();
+  const terminal = new Set(['completed', 'failed', 'rejected', 'cancelled']);
+  let job;
+  while (Date.now() - started < ALPHA_JOB_TIMEOUT_MS) {
+    await sleep(2500);
+    job = await xoraRequest(`/jobs/${encodeURIComponent(jobId)}`, { method: 'GET' });
+    const pct = Number(job.progress);
+    const state = String(job.state || 'processing');
+    onProgress(state, Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : null);
+    if (terminal.has(state)) break;
+  }
+  if (!job || !terminal.has(job.state)) throw new Error('Alpha processing timed out. Your original video is still available; try again later.');
+  alphaInputTokens.delete(token);
+  if (job.state !== 'completed') {
+    const detail = job.error && (job.error.message || job.error.code) || job.message || job.state;
+    throw new Error(`Alpha processing ${job.state}: ${detail}`);
+  }
+  const firstOutput = Array.isArray(job.outputs) ? job.outputs[0] : (job.outputs && (job.outputs.out_1 || Object.values(job.outputs)[0]));
+  const namedOutput = job.output_files && (job.output_files.out_1 || Object.values(job.output_files)[0]);
+  const outputUrl = (job.output && (job.output.signedUrl || job.output.url))
+    || (firstOutput && (firstOutput.signedUrl || firstOutput.url || firstOutput.downloadUrl))
+    || (typeof firstOutput === 'string' ? firstOutput : null)
+    || (namedOutput && (namedOutput.signedUrl || namedOutput.url || namedOutput.storage_url))
+    || (typeof namedOutput === 'string' ? namedOutput : null);
+  if (!outputUrl) throw new Error('Alpha completed but did not return an output download URL.');
+  return { outputUrl, jobId };
+}
+
+async function runAlpha(ctx, pending, targetFps) {
+  const meta = await inspectMedia(pending.inputPath);
+  const estimate = alphaEstimate(meta, targetFps);
+  const status = await ctx.reply('⚡ Alpha\nPreparing your video…');
+  let outputPath;
+  try {
+    await editProgress(ctx, status.message_id, '⚡ Alpha\nUploading video…', true);
+    const result = await createAlphaJob(pending.inputPath, targetFps, estimate, (stage, percent) => {
+      editProgress(ctx, status.message_id,
+        `⚡ Alpha\nStage: ${stage}${percent === null ? '' : `\nProgress: ${percent}%`}\nEstimated output: ${fmtTime(estimate.outputDuration)}`
+      ).catch(() => {});
+    });
+    outputPath = tempPath(ctx.from.id, 'alpha_result', '.wmv');
+    await editProgress(ctx, status.message_id, '⚡ Alpha\nDownloading finished video…', true);
+    await downloadToFile(result.outputUrl, outputPath, MAX_UPLOAD_BYTES);
+    await editProgress(ctx, status.message_id, '📤 Sending your video…', true);
+    const caption = `✅ Alpha completed\nOutput: 720p WMV\n${targetFps ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` : 'FPS patch: Off\n'}Estimated duration: ${fmtTime(estimate.outputDuration)}\nEstimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
+    await sendDocumentFile(ctx, outputPath, caption);
+    await editProgress(ctx, status.message_id, '✅ Alpha completed.', true);
+    pendingVideos.delete(ctx.from.id);
+  } catch (err) {
+    await editProgress(ctx, status.message_id, `❌ Alpha failed\n${scrub(err.message || err).slice(0, 1000)}\n\nYour original video is still available.`, true);
+    throw err;
+  } finally {
+    if (outputPath) await fs.promises.unlink(outputPath).catch(() => {});
+  }
 }
 
 // Mini App ("Checker & Downloader") lives on Netlify. It is opened from the chat menu button
@@ -380,7 +515,7 @@ function mainKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
     [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
-    [Markup.button.callback('🧰 FFmpeg Method', 'menu:ffmpeg')],
+    [Markup.button.callback('⚡ Alpha', 'menu:alpha')],
   ]);
 }
 function hdKeyboard() {
@@ -397,10 +532,27 @@ function optimizerKeyboard() {
     [Markup.button.callback('⬅️ Back', 'menu:hd')],
   ]);
 }
-function ffmpegKeyboard() {
+function alphaConfirmKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('30 FPS', 'ffmpeg:fps:30'), Markup.button.callback('60 FPS', 'ffmpeg:fps:60')],
+    [Markup.button.callback('✅ Yes', 'alpha:confirm'), Markup.button.callback('❌ No', 'menu:main')],
+  ]);
+}
+function alphaPatchKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Yes', 'alpha:patch:yes'), Markup.button.callback('❌ No', 'alpha:patch:no')],
     [Markup.button.callback('⬅️ Back', 'menu:main')],
+  ]);
+}
+function alphaFpsKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('60 FPS', 'alpha:fps:60'), Markup.button.callback('30 FPS', 'alpha:fps:30')],
+    [Markup.button.callback('⬅️ Back', 'alpha:confirm')],
+  ]);
+}
+function alphaStartKeyboard(fps) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🚀 Start Alpha', `alpha:start:${fps}`)],
+    [Markup.button.callback('⬅️ Back', 'alpha:patch:yes')],
   ]);
 }
 
@@ -430,7 +582,7 @@ bot.start(async (ctx) => {
   }
   return ctx.reply(text);
 });
-bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis) or FFmpeg. Send a TikTok link, or use the menu button at the left of the chat, for the Checker & Downloader.'));
+bot.help((ctx) => ctx.reply('Send a video, then choose Enhanced, HD (Luna/Jarvis) or Alpha. Send a TikTok link, or use the menu button at the left of the chat, for the Checker & Downloader.'));
 
 bot.on(['video', 'document'], async (ctx) => {
   const file = ctx.message.video || ctx.message.document;
@@ -450,7 +602,7 @@ bot.on(['video', 'document'], async (ctx) => {
 bot.action('menu:main', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('Choose a method:', mainKeyboard()); });
 bot.action('menu:hd', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('⚠️ HD METHOD\nChoose a processing engine:', hdKeyboard()); });
 bot.action('menu:jarvis', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\nChoose whether Kuronai should re-encode the video:', optimizerKeyboard()); });
-bot.action('menu:ffmpeg', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('🎞 FFmpeg Method\nChoose target FPS:', ffmpegKeyboard()); });
+bot.action('menu:alpha', async (ctx) => { await ctx.answerCbQuery(); return ctx.editMessageText('⚡ Alpha\n\n720p output with optional 30 FPS or 60 FPS patching.\n\nDo you still want to use Alpha?', alphaConfirmKeyboard()); });
 
 async function getPending(ctx) {
   const p = pendingVideos.get(ctx.from.id);
@@ -487,9 +639,36 @@ bot.action(/^jarvis:optimizer:(on|off)$/, async (ctx) => {
   await ctx.answerCbQuery();
   return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runKuronai(ctx, p, 'jarvis', ctx.match[1] === 'on'); });
 });
-bot.action(/^ffmpeg:fps:(30|60)$/, async (ctx) => {
-  const fps = Number(ctx.match[1]); await ctx.answerCbQuery();
-  return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runLocalMethod(ctx, p, 'ffmpeg', { targetFps: fps }); });
+bot.action('alpha:confirm', async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('⚡ Alpha\n\nDo you want to patch FPS?', alphaPatchKeyboard());
+});
+bot.action('alpha:patch:yes', async (ctx) => {
+  await ctx.answerCbQuery();
+  return ctx.editMessageText('Choose the target FPS:', alphaFpsKeyboard());
+});
+bot.action('alpha:patch:no', async (ctx) => {
+  await ctx.answerCbQuery();
+  return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runAlpha(ctx, p, null); });
+});
+bot.action(/^alpha:fps:(30|60)$/, async (ctx) => {
+  const fps = Number(ctx.match[1]);
+  await ctx.answerCbQuery('Calculating estimate…');
+  const p = await getPending(ctx);
+  if (!p) return;
+  try {
+    const meta = await inspectMedia(p.inputPath);
+    const estimate = alphaEstimate(meta, fps);
+    const preview = `⚡ Alpha\n\nSource FPS: ${estimate.sourceFps.toFixed(3)}\nTarget FPS: ${fps}\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\nEstimated output duration: ${fmtTime(estimate.outputDuration)}\nEstimated output size: ${estimate.estimatedMB.toFixed(1)} MB\nVideo bitrate: ${ALPHA_VIDEO_BITRATE}\n\nStart processing?`;
+    return ctx.editMessageText(preview, alphaStartKeyboard(fps));
+  } catch (err) {
+    return ctx.reply(`❌ Could not estimate Alpha output: ${scrub(err.message)}`);
+  }
+});
+bot.action(/^alpha:start:(30|60)$/, async (ctx) => {
+  const fps = Number(ctx.match[1]);
+  await ctx.answerCbQuery();
+  return withBusy(ctx, async () => { const p = await getPending(ctx); if (p) await runAlpha(ctx, p, fps); });
 });
 
 function validTikTokUrl(value) {
@@ -519,6 +698,18 @@ bot.catch((err, ctx) => {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.get('/', (_req, res) => res.json({ status: 'ok', service: 'JV Methods Bot' }));
+// Short-lived, unguessable HTTPS input URLs used by Alpha so Xora can fetch Telegram uploads.
+setInterval(() => { for (const [token, entry] of alphaInputTokens) if (entry.expiresAt < Date.now()) alphaInputTokens.delete(token); }, 10 * 60 * 1000).unref();
+app.get('/alpha-input/:token', (req, res) => {
+  const entry = alphaInputTokens.get(req.params.token);
+  if (!entry || entry.expiresAt < Date.now() || !fs.existsSync(entry.path)) {
+    alphaInputTokens.delete(req.params.token);
+    return res.status(404).end('Not found');
+  }
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Type', 'application/octet-stream');
+  return res.sendFile(entry.path, (err) => { if (err && !res.headersSent) res.status(500).end('File unavailable'); });
+});
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`[server] Listening on ${PORT}`);
