@@ -1,5 +1,5 @@
-// JV Methods Bot — Enhanced / HD (Luna + Jarvis) / Alpha / TikTok Checker
-// Requires Node.js 20+
+// JV Methods Bot — Enhanced / HD (Luna + Jarvis) / FFmpeg / TikTok Checker
+// Requires Node.js 20+.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,7 +18,6 @@ const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
 const WEBHOOK_PATH = `/webhook/${process.env.WEBHOOK_SECRET || 'jv-bot'}`;
 const METHODS_DIR = path.join(__dirname, 'methods');
 const WORK_DIR = path.join(os.tmpdir(), 'jv_bot_work');
-
 const MAX_VIDEO_MB = Number(process.env.MAX_VIDEO_MB || 200);
 const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
 
@@ -26,15 +25,16 @@ const REQUIRED_CHANNEL = process.env.REQUIRED_CHANNEL || '@jv_60fps';
 const REQUIRED_CHANNEL_URL = process.env.REQUIRED_CHANNEL_URL || 'https://t.me/jv_60fps';
 
 const KURONAI_API = 'https://api.kuronaiapp.com';
-const TELEGRAM_API_ROOT = (
-  process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org'
-).replace(/\/$/, '');
+
+const TELEGRAM_API_ROOT =
+  (process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org').replace(/\/$/, '');
 
 const CLEANUP_TOKEN = process.env.CLEANUP_TOKEN || '';
 
-const TIKWM_HOSTS = (
-  process.env.TIKWM_API_BASE || 'https://www.tikwm.com,https://tikwm.com'
-).split(',').map(h => h.trim().replace(/\/$/, '')).filter(Boolean);
+const TIKWM_HOSTS = (process.env.TIKWM_API_BASE || 'https://www.tikwm.com,https://tikwm.com')
+  .split(',')
+  .map(h => h.trim().replace(/\/$/, ''))
+  .filter(Boolean);
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -44,8 +44,8 @@ const BROWSER_HEADERS = {
 };
 
 const FFPROBE_PKG = require('ffprobe-static');
-const FFPROBE = process.env.FFPROBE_PATH ||
-  (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
+const FFPROBE =
+  process.env.FFPROBE_PATH || (FFPROBE_PKG && FFPROBE_PKG.path) || 'ffprobe';
 
 if (!BOT_TOKEN) {
   console.error('Set BOT_TOKEN environment variable.');
@@ -61,11 +61,6 @@ if (
   process.exit(1);
 }
 
-if (!Number.isFinite(MAX_VIDEO_MB) || MAX_VIDEO_MB <= 0) {
-  console.error('MAX_VIDEO_MB must be a positive number.');
-  process.exit(1);
-}
-
 fs.mkdirSync(WORK_DIR, { recursive: true });
 
 function scrub(value) {
@@ -74,26 +69,50 @@ function scrub(value) {
     .replace(/bot\d{6,}:[A-Za-z0-9_-]{20,}/g, 'bot[token]');
 }
 
-const SELF_HOSTED = TELEGRAM_API_ROOT !== 'https://api.telegram.org';
-
-const MAX_UPLOAD_BYTES = (
-  SELF_HOSTED ? MAX_VIDEO_MB : Math.min(MAX_VIDEO_MB, 49)
-) * 1048576;
-
-const UPLOAD_TIMEOUT_MS = Number(
-  process.env.TELEGRAM_UPLOAD_TIMEOUT_MS || 10 * 60 * 1000
-);
-
 const bot = new Telegraf(BOT_TOKEN, {
   handlerTimeout: 30 * 60 * 1000,
   telegram: {
     agent: new https.Agent({ keepAlive: false }),
     apiRoot: TELEGRAM_API_ROOT
-  }
+  },
 });
 
 const pendingVideos = new Map();
 const busyUsers = new Set();
+
+// Prevent Telegram webhook retries from processing the same update twice.
+// This protects one running bot instance. Keep Render instance count at 1.
+const seenUpdates = new Map();
+const UPDATE_DEDUPE_TTL_MS = 10 * 60 * 1000;
+const UPDATE_DEDUPE_MAX = 10000;
+
+bot.use(async (ctx, next) => {
+  const updateId = ctx.update && ctx.update.update_id;
+
+  if (Number.isInteger(updateId)) {
+    const now = Date.now();
+
+    for (const [id, timestamp] of seenUpdates) {
+      if (now - timestamp > UPDATE_DEDUPE_TTL_MS) {
+        seenUpdates.delete(id);
+      }
+    }
+
+    if (seenUpdates.has(updateId)) {
+      console.log(`[dedupe] Ignored duplicate Telegram update ${updateId}`);
+      return;
+    }
+
+    seenUpdates.set(updateId, now);
+
+    if (seenUpdates.size > UPDATE_DEDUPE_MAX) {
+      const oldest = seenUpdates.keys().next().value;
+      seenUpdates.delete(oldest);
+    }
+  }
+
+  return next();
+});
 
 async function removePendingVideo(userId, pending) {
   if (pending && pending.inputPath) {
@@ -106,12 +125,8 @@ async function removePendingVideo(userId, pending) {
 }
 
 // Membership verification
-
 bot.use(async (ctx, next) => {
-  if (
-    !ctx.from ||
-    (ctx.callbackQuery && ctx.callbackQuery.data === 'membership:check')
-  ) {
+  if (!ctx.from || (ctx.callbackQuery && ctx.callbackQuery.data === 'membership:check')) {
     return next();
   }
 
@@ -128,24 +143,12 @@ bot.use(async (ctx, next) => {
     if (isMember) return next();
 
     const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.url(
-          '📢 Join JV-60FPS Channel',
-          REQUIRED_CHANNEL_URL
-        )
-      ],
-      [
-        Markup.button.callback(
-          '✅ I Joined — Check Again',
-          'membership:check'
-        )
-      ]
+      [Markup.button.url('📢 Join JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+      [Markup.button.callback('✅ I Joined — Check Again', 'membership:check')],
     ]);
 
     const message =
-      '🔒 Channel Membership Required\n\n' +
-      'Please join our channel first to use this bot. ' +
-      'After joining, tap “I Joined — Check Again”.';
+      '🔒 Channel Membership Required\n\nPlease join our channel first to use this bot. After joining, tap “I Joined — Check Again”.';
 
     if (ctx.callbackQuery) {
       await ctx.answerCbQuery(
@@ -165,22 +168,12 @@ bot.use(async (ctx, next) => {
     );
 
     const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.url(
-          '📢 Open JV-60FPS Channel',
-          REQUIRED_CHANNEL_URL
-        )
-      ],
-      [
-        Markup.button.callback(
-          '🔄 Try Again',
-          'membership:check'
-        )
-      ]
+      [Markup.button.url('📢 Open JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+      [Markup.button.callback('🔄 Try Again', 'membership:check')],
     ]);
 
     await ctx.reply(
-      '⚠️ I could not verify your channel membership. Please try again.',
+      '⚠️ I could not verify your channel membership. Please try again in a moment. If this keeps happening, the bot administrator must add this bot as an administrator to @jv_60fps.',
       keyboard
     ).catch(() => {});
   }
@@ -199,21 +192,15 @@ const METHODS = {
   },
   alpha: {
     label: '⚡ Alpha'
-  }
+  },
 };
 
 const XORA_API = 'https://api.xora.sh/v1';
 const XORA_API_KEY = process.env.XORA_API_KEY || '';
-
-const ALPHA_VIDEO_BITRATE =
-  process.env.ALPHA_VIDEO_BITRATE || '18M';
-
-const ALPHA_AUDIO_BITRATE =
-  process.env.ALPHA_AUDIO_BITRATE || '128k';
-
-const ALPHA_JOB_TIMEOUT_MS = Number(
-  process.env.ALPHA_JOB_TIMEOUT_MS || 15 * 60 * 1000
-);
+const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '18M';
+const ALPHA_AUDIO_BITRATE = process.env.ALPHA_AUDIO_BITRATE || '128k';
+const ALPHA_JOB_TIMEOUT_MS =
+  Number(process.env.ALPHA_JOB_TIMEOUT_MS || 15 * 60 * 1000);
 
 const alphaInputTokens = new Map();
 
@@ -257,19 +244,15 @@ function loadMethod(file) {
 function fmtTime(ms) {
   const s = Math.max(0, Math.floor(ms / 1000));
 
-  return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(
-    Math.floor((s % 3600) / 60)
-  ).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
 
 async function editProgress(ctx, messageId, text, force = false) {
   const now = Date.now();
 
-  if (
-    !force &&
-    ctx.__lastProgressEdit &&
-    now - ctx.__lastProgressEdit < 1100
-  ) return;
+  if (!force && ctx.__lastProgressEdit && now - ctx.__lastProgressEdit < 1100) {
+    return;
+  }
 
   ctx.__lastProgressEdit = now;
 
@@ -293,50 +276,45 @@ function mediaHeaders(url) {
   }
 }
 
-// Streaming download with file-size enforcement
-
+// Stream a download to disk with a hard size limit.
 async function downloadToFile(
   url,
   destPath,
-  maxBytes = MAX_VIDEO_BYTES
+  maxBytes = MAX_VIDEO_BYTES,
+  extraHeaders = {}
 ) {
   const response = await fetch(url, {
     redirect: 'follow',
-    headers: mediaHeaders(url),
-    signal: AbortSignal.timeout(15 * 60 * 1000)
+    headers: {
+      ...mediaHeaders(url),
+      ...extraHeaders
+    },
+    signal: AbortSignal.timeout(15 * 60 * 1000),
   });
 
   if (!response.ok || !response.body) {
     throw new Error(`Download failed: HTTP ${response.status}`);
   }
 
-  const declared = Number(
-    response.headers.get('content-length') || 0
-  );
+  const declared = Number(response.headers.get('content-length') || 0);
 
   if (declared && declared > maxBytes) {
     await response.body.cancel().catch(() => {});
-    throw new Error(
-      `File exceeds ${Math.floor(maxBytes / 1048576)} MB limit.`
-    );
+    throw new Error(`File exceeds ${Math.floor(maxBytes / 1048576)} MB limit.`);
   }
 
   let received = 0;
 
   const limiter = new Transform({
-    transform(chunk, encoding, callback) {
+    transform(chunk, _encoding, callback) {
       received += chunk.length;
 
       if (received > maxBytes) {
-        callback(
-          new Error(
-            `File exceeds ${Math.floor(maxBytes / 1048576)} MB limit.`
-          )
-        );
+        callback(new Error(`File exceeds ${Math.floor(maxBytes / 1048576)} MB limit.`));
       } else {
         callback(null, chunk);
       }
-    }
+    },
   });
 
   try {
@@ -358,29 +336,27 @@ async function downloadToFile(
   }
 }
 
-// Remote Telegram API temporary-file cleanup
-
+// Secure cleanup route on the separate Telegram API gateway.
 async function cleanupTelegramApiFiles(paths) {
   if (
     !SELF_HOSTED ||
     !CLEANUP_TOKEN ||
     !Array.isArray(paths) ||
     !paths.length
-  ) return;
+  ) {
+    return;
+  }
 
   try {
-    const response = await fetch(
-      `${TELEGRAM_API_ROOT}/cleanup`,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-cleanup-token': CLEANUP_TOKEN
-        },
-        body: JSON.stringify({ paths }),
-        signal: AbortSignal.timeout(30000)
-      }
-    );
+    const response = await fetch(`${TELEGRAM_API_ROOT}/cleanup`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-cleanup-token': CLEANUP_TOKEN,
+      },
+      body: JSON.stringify({ paths }),
+      signal: AbortSignal.timeout(30000),
+    });
 
     if (!response.ok) {
       const detail = await response.text().catch(() => '');
@@ -398,19 +374,16 @@ async function cleanupTelegramApiFiles(paths) {
   }
 }
 
-// Telegram file download
-
+// Download from Telegram.
+// Local Bot API mode returns a filesystem path belonging to the API service.
+// The bot service cannot access that separate Render disk, so it uses /download.
 async function telegramDownload(ctx, file, userId) {
   const ext = path.extname(file.file_name || '') || '.mp4';
-
   const inputPath = tempPath(userId, 'input', ext);
-
   const fileSize = Number(file.file_size || 0);
 
   if (fileSize && fileSize > MAX_VIDEO_BYTES) {
-    throw new Error(
-      `Video exceeds this bot's ${MAX_VIDEO_MB} MB limit.`
-    );
+    throw new Error(`Video exceeds this bot's ${MAX_VIDEO_MB} MB limit.`);
   }
 
   let apiFilePath = null;
@@ -418,11 +391,7 @@ async function telegramDownload(ctx, file, userId) {
   try {
     const info = await ctx.telegram.getFile(file.file_id);
 
-    if (
-      SELF_HOSTED &&
-      info.file_path &&
-      path.isAbsolute(info.file_path)
-    ) {
+    if (SELF_HOSTED && info.file_path && path.isAbsolute(info.file_path)) {
       apiFilePath = info.file_path;
     } else if (!SELF_HOSTED && fileSize > 20 * 1048576) {
       throw new Error(
@@ -430,13 +399,32 @@ async function telegramDownload(ctx, file, userId) {
       );
     }
 
-    const link = await ctx.telegram.getFileLink(file.file_id);
+    if (SELF_HOSTED && apiFilePath) {
+      if (!CLEANUP_TOKEN) {
+        throw new Error('CLEANUP_TOKEN is missing from the bot service.');
+      }
 
-    await downloadToFile(
-      link.href || String(link),
-      inputPath,
-      MAX_VIDEO_BYTES
-    );
+      const downloadUrl =
+        `${TELEGRAM_API_ROOT}/download?path=${encodeURIComponent(apiFilePath)}`;
+
+      await downloadToFile(
+        downloadUrl,
+        inputPath,
+        MAX_VIDEO_BYTES,
+        {
+          'x-cleanup-token': CLEANUP_TOKEN,
+        }
+      );
+
+    } else {
+      const link = await ctx.telegram.getFileLink(file.file_id);
+
+      await downloadToFile(
+        link.href || String(link),
+        inputPath,
+        MAX_VIDEO_BYTES
+      );
+    }
 
     return inputPath;
 
@@ -451,16 +439,18 @@ async function telegramDownload(ctx, file, userId) {
   }
 }
 
-// Telegram upload
+// Telegram delivery
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const UPLOAD_TIMEOUT_MS =
+  Number(process.env.TELEGRAM_UPLOAD_TIMEOUT_MS || 10 * 60 * 1000);
 
-async function telegramUploadOnce(
-  method,
-  field,
-  filePath,
-  params
-) {
+const SELF_HOSTED = TELEGRAM_API_ROOT !== 'https://api.telegram.org';
+
+const MAX_UPLOAD_BYTES =
+  (SELF_HOSTED ? MAX_VIDEO_MB : Math.min(MAX_VIDEO_MB, 49)) * 1048576;
+
+async function telegramUploadOnce(method, field, filePath, params) {
   const form = new FormData();
 
   for (const [key, value] of Object.entries(params)) {
@@ -474,9 +464,10 @@ async function telegramUploadOnce(
 
   const uploadBlob = typeof fs.openAsBlob === 'function'
     ? await fs.openAsBlob(filePath, { type: mimeType })
-    : new Blob([
-        await fs.promises.readFile(filePath)
-      ], { type: mimeType });
+    : new Blob(
+        [await fs.promises.readFile(filePath)],
+        { type: mimeType }
+      );
 
   form.append(
     field,
@@ -492,7 +483,7 @@ async function telegramUploadOnce(
       {
         method: 'POST',
         body: form,
-        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS)
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
       }
     );
 
@@ -502,8 +493,7 @@ async function telegramUploadOnce(
       : (err && err.name);
 
     const dropped = new Error(
-      `connection to Telegram dropped during ${method}` +
-      (detail ? ` (${scrub(detail)})` : '')
+      `connection to Telegram dropped during ${method}${detail ? ` (${scrub(detail)})` : ''}`
     );
 
     dropped.transient = true;
@@ -521,12 +511,7 @@ async function telegramUploadOnce(
   }
 
   const rejected = new Error(
-    `Telegram rejected ${method}: ${
-      scrub(
-        (data && data.description) ||
-        `HTTP ${response.status}`
-      )
-    }`
+    `Telegram rejected ${method}: ${scrub((data && data.description) || `HTTP ${response.status}`)}`
   );
 
   rejected.status = response.status;
@@ -551,13 +536,7 @@ async function telegramUpload(
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      await telegramUploadOnce(
-        method,
-        field,
-        filePath,
-        params
-      );
-
+      await telegramUploadOnce(method, field, filePath, params);
       return { attempts: attempt };
 
     } catch (err) {
@@ -608,7 +587,10 @@ async function sendVideoFile(ctx, filePath, caption) {
       'sendVideo',
       'video',
       filePath,
-      { ...base, supports_streaming: true }
+      {
+        ...base,
+        supports_streaming: true
+      }
     );
 
     return {
@@ -620,10 +602,7 @@ async function sendVideoFile(ctx, filePath, caption) {
     videoError = err;
   }
 
-  if (
-    !videoError.transient &&
-    videoError.status !== 400
-  ) {
+  if (!videoError.transient && videoError.status !== 400) {
     throw new Error(videoError.message);
   }
 
@@ -666,13 +645,12 @@ async function sendDocumentFile(ctx, filePath, caption) {
     filePath,
     {
       chat_id: ctx.chat.id,
-      caption: String(caption || '').slice(0, 900)
+      caption: String(caption || '').slice(0, 900),
     }
   );
 }
 
-// Kuronai upload
-
+// Kuronai upload protocol
 async function kuronaiUpload(
   inputPath,
   telegramId,
@@ -684,16 +662,12 @@ async function kuronaiUpload(
 
   const blob = typeof fs.openAsBlob === 'function'
     ? await fs.openAsBlob(inputPath, { type: 'video/mp4' })
-    : new Blob([
-        await fs.promises.readFile(inputPath)
-      ], { type: 'video/mp4' });
+    : new Blob(
+        [await fs.promises.readFile(inputPath)],
+        { type: 'video/mp4' }
+      );
 
-  form.append(
-    'file',
-    blob,
-    safeName(path.basename(inputPath))
-  );
-
+  form.append('file', blob, safeName(path.basename(inputPath)));
   form.append('tg_id', String(telegramId));
   form.append('progress', 'true');
 
@@ -722,18 +696,12 @@ async function kuronaiUpload(
     );
   }
 
-  const contentType =
-    response.headers.get('content-type') || '';
-
+  const contentType = response.headers.get('content-type') || '';
   let result = null;
 
-  if (
-    contentType.includes('application/x-ndjson') &&
-    response.body
-  ) {
+  if (contentType.includes('application/x-ndjson') && response.body) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-
     let pending = '';
 
     while (true) {
@@ -760,8 +728,7 @@ async function kuronaiUpload(
 
         if (event.type === 'error') {
           throw new Error(
-            event.message || event.code ||
-            'Kuronai server processing failed.'
+            event.message || event.code || 'Kuronai server processing failed.'
           );
         }
 
@@ -794,10 +761,7 @@ async function kuronaiUpload(
         }
 
       } catch (e) {
-        if (
-          e.message &&
-          !e.message.includes('Unexpected')
-        ) {
+        if (e.message && !e.message.includes('Unexpected')) {
           throw e;
         }
       }
@@ -807,14 +771,8 @@ async function kuronaiUpload(
     result = await response.json();
   }
 
-  if (
-    !result ||
-    typeof result.file_id !== 'string' ||
-    !result.file_id
-  ) {
-    throw new Error(
-      'Kuronai response did not contain a file_id.'
-    );
+  if (!result || typeof result.file_id !== 'string' || !result.file_id) {
+    throw new Error('Kuronai response did not contain a file_id.');
   }
 
   return result.file_id;
@@ -831,14 +789,11 @@ async function kuronaiDownload(fileId, outputPath, onProgress) {
     );
   }
 
-  const total = Number(
-    response.headers.get('content-length') || 0
-  );
-
+  const total = Number(response.headers.get('content-length') || 0);
   const out = fs.createWriteStream(outputPath);
   let received = 0;
 
-  for await (const chunk of Readable.fromWeb(response.body)) {
+  for await (const chunk of require('stream').Readable.fromWeb(response.body)) {
     received += chunk.length;
 
     if (!out.write(chunk)) {
@@ -866,17 +821,10 @@ async function kuronaiCleanup(fileId) {
   } catch (_) {}
 }
 
-// Enhanced and Jarvis processing
-
 async function runKuronai(ctx, pending, mode, encodeVideo) {
   const enhanced = mode === 'enhanced';
-
   const route = enhanced ? '/uploaden/' : '/upload/';
-
-  const title = enhanced
-    ? 'Enhanced Method'
-    : 'Jarvis HQ Method';
-
+  const title = enhanced ? 'Enhanced Method' : 'Jarvis HQ Method';
   const started = Date.now();
 
   const status = await ctx.reply(
@@ -890,10 +838,10 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   let processing = true;
   let inflight = Promise.resolve();
 
-  const progressText = pct =>
+  const progressText = (pct) =>
     `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`;
 
-  const showProgress = pct => {
+  const showProgress = (pct) => {
     if (processing) {
       inflight = editProgress(
         ctx,
@@ -901,6 +849,12 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
         progressText(pct)
       ).catch(() => {});
     }
+  };
+
+  const stopProgress = async () => {
+    processing = false;
+    clearInterval(timer);
+    await inflight;
   };
 
   const timer = setInterval(() => {
@@ -911,19 +865,13 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     );
   }, 3000);
 
-  const stopProgress = async () => {
-    processing = false;
-    clearInterval(timer);
-    await inflight;
-  };
-
   try {
     fileId = await kuronaiUpload(
       pending.inputPath,
       ctx.from.id,
       route,
       encodeVideo,
-      event => {
+      (event) => {
         if (Number.isFinite(Number(event.percent))) {
           lastPercent = Math.max(
             0,
@@ -932,15 +880,11 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
         }
 
         if (event.stage || event.step) {
-          lastStage = String(
-            event.stage || event.step
-          ).slice(0, 50);
+          lastStage = String(event.stage || event.step).slice(0, 50);
         }
 
         showProgress(
-          lastPercent === null
-            ? 'Server working'
-            : `${lastPercent}%`
+          lastPercent === null ? 'Server working' : `${lastPercent}%`
         );
       }
     );
@@ -963,7 +907,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     await kuronaiDownload(
       fileId,
       outputPath,
-      percent => {
+      (percent) => {
         editProgress(
           ctx,
           status.message_id,
@@ -982,13 +926,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     const delivery = await sendVideoFile(
       ctx,
       outputPath,
-      `✅ ${title} complete\nOptimizer: ${
-        enhanced
-          ? 'N/A'
-          : (encodeVideo
-              ? 'ON — re-encode requested'
-              : 'OFF — re-encode disabled')
-      }`
+      `✅ ${title} complete\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON — re-encode requested' : 'OFF — re-encode disabled')}`
     );
 
     const deliveryNote =
@@ -1031,8 +969,6 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   }
 }
 
-// Luna local processing
-
 async function runLocalMethod(ctx, pending, methodKey) {
   const userId = ctx.from.id;
 
@@ -1047,18 +983,13 @@ async function runLocalMethod(ctx, pending, methodKey) {
   try {
     const mod = loadMethod('c_method.js');
 
-    await mod.process(
-      pending.inputPath,
-      outputPath
-    );
+    await mod.process(pending.inputPath, outputPath);
 
     if (
       !fs.existsSync(outputPath) ||
       fs.statSync(outputPath).size === 0
     ) {
-      throw new Error(
-        'The method did not produce a valid output file.'
-      );
+      throw new Error('The method did not produce a valid output file.');
     }
 
     await ctx.telegram.editMessageText(
@@ -1098,23 +1029,18 @@ async function runLocalMethod(ctx, pending, methodKey) {
   }
 }
 
-// Alpha FPS processing
-
 function parseFps(value) {
   if (!value || value === '0/0' || value === 'N/A') {
     return NaN;
   }
 
   const parts = String(value).split('/');
-
   const n = Number(parts[0]);
   const d = parts.length > 1 ? Number(parts[1]) : 1;
 
-  return Number.isFinite(n) &&
-    Number.isFinite(d) &&
-    d > 0
-      ? n / d
-      : NaN;
+  return Number.isFinite(n) && Number.isFinite(d) && d > 0
+    ? n / d
+    : NaN;
 }
 
 function alphaEstimate(meta, targetFps) {
@@ -1128,9 +1054,7 @@ function alphaEstimate(meta, targetFps) {
     parseFps(stream.avg_frame_rate) ||
     parseFps(stream.r_frame_rate);
 
-  const duration = Number(
-    meta.format && meta.format.duration
-  );
+  const duration = Number(meta.format && meta.format.duration);
 
   if (!Number.isFinite(sourceFps) || sourceFps <= 0) {
     throw new Error('Could not detect the source FPS.');
@@ -1140,23 +1064,18 @@ function alphaEstimate(meta, targetFps) {
     throw new Error('Could not detect the video duration.');
   }
 
-  const scaleFactor = targetFps
-    ? sourceFps / targetFps
-    : 1;
-
+  const scaleFactor = targetFps ? sourceFps / targetFps : 1;
   const outputDuration = duration * scaleFactor;
 
-  const videoBps = Number(
-    String(ALPHA_VIDEO_BITRATE)
+  const videoBps =
+    Number(String(ALPHA_VIDEO_BITRATE)
       .replace(/k$/i, '000')
-      .replace(/m$/i, '000000')
-  ) || 18000000;
+      .replace(/m$/i, '000000')) || 18000000;
 
-  const audioBps = Number(
-    String(ALPHA_AUDIO_BITRATE)
+  const audioBps =
+    Number(String(ALPHA_AUDIO_BITRATE)
       .replace(/k$/i, '000')
-      .replace(/m$/i, '000000')
-  ) || 128000;
+      .replace(/m$/i, '000000')) || 128000;
 
   const estimatedMB =
     ((videoBps + audioBps) * outputDuration / 8) / 1048576;
@@ -1172,9 +1091,7 @@ function alphaEstimate(meta, targetFps) {
 
 async function xoraRequest(route, options = {}) {
   if (!XORA_API_KEY) {
-    throw new Error(
-      'Alpha is not configured yet. Please contact the bot administrator.'
-    );
+    throw new Error('Alpha is not configured yet. Please contact the bot administrator.');
   }
 
   const response = await fetch(
@@ -1185,12 +1102,11 @@ async function xoraRequest(route, options = {}) {
         Authorization: `Bearer ${XORA_API_KEY}`,
         ...(options.headers || {})
       },
-      signal: options.signal || AbortSignal.timeout(120000)
+      signal: options.signal || AbortSignal.timeout(120000),
     }
   );
 
   const raw = await response.text();
-
   let data = {};
 
   try {
@@ -1201,8 +1117,7 @@ async function xoraRequest(route, options = {}) {
 
   if (!response.ok) {
     const detail =
-      data.error &&
-      (data.error.message || data.error.code) ||
+      data.error && (data.error.message || data.error.code) ||
       data.message ||
       data.detail ||
       `HTTP ${response.status}`;
@@ -1236,7 +1151,6 @@ async function createAlphaJob(
     `${PUBLIC_URL.replace(/\/$/, '')}/alpha-input/${token}`;
 
   const outputName = `alpha_${Date.now()}.wmv`;
-
   const args = [];
 
   if (targetFps) {
@@ -1245,17 +1159,12 @@ async function createAlphaJob(
 
   args.push(
     '-i', '{{input}}',
-    '-map', '0:v:0',
-    '-map', '0:a?',
+    '-map', '0:v:0', '-map', '0:a?',
     '-vf', 'scale=-2:720:flags=lanczos',
-    '-c:v', 'wmv2',
-    '-b:v', ALPHA_VIDEO_BITRATE,
-    '-maxrate', '20M',
-    '-bufsize', '36M',
-    '-c:a', 'wmav2',
-    '-b:a', ALPHA_AUDIO_BITRATE,
-    '-f', 'asf',
-    '{{output}}'
+    '-c:v', 'wmv2', '-b:v', ALPHA_VIDEO_BITRATE,
+    '-maxrate', '20M', '-bufsize', '36M',
+    '-c:a', 'wmav2', '-b:a', ALPHA_AUDIO_BITRATE,
+    '-f', 'asf', '{{output}}'
   );
 
   const created = await xoraRequest(
@@ -1274,7 +1183,7 @@ async function createAlphaJob(
           out_1: outputName
         },
         ffmpeg: {
-          args: args.map(arg =>
+          args: args.map((arg) =>
             arg === '{{input}}'
               ? '{{in_1}}'
               : arg === '{{output}}'
@@ -1282,8 +1191,8 @@ async function createAlphaJob(
                 : arg
           )
         },
-        idempotencyKey: `alpha-${crypto.randomUUID()}`
-      })
+        idempotencyKey: `alpha-${crypto.randomUUID()}`,
+      }),
     }
   );
 
@@ -1294,7 +1203,6 @@ async function createAlphaJob(
   }
 
   const started = Date.now();
-
   const terminal = new Set([
     'completed',
     'failed',
@@ -1322,7 +1230,9 @@ async function createAlphaJob(
         : null
     );
 
-    if (terminal.has(state)) break;
+    if (terminal.has(state)) {
+      break;
+    }
   }
 
   if (!job || !terminal.has(job.state)) {
@@ -1335,8 +1245,7 @@ async function createAlphaJob(
 
   if (job.state !== 'completed') {
     const detail =
-      job.error &&
-      (job.error.message || job.error.code) ||
+      job.error && (job.error.message || job.error.code) ||
       job.message ||
       job.state;
 
@@ -1350,8 +1259,7 @@ async function createAlphaJob(
         (job.outputs.out_1 || Object.values(job.outputs)[0])
       );
 
-  const namedOutput =
-    job.output_files &&
+  const namedOutput = job.output_files &&
     (job.output_files.out_1 || Object.values(job.output_files)[0]);
 
   const outputUrl =
@@ -1370,17 +1278,17 @@ async function createAlphaJob(
     (typeof namedOutput === 'string' ? namedOutput : null);
 
   if (!outputUrl) {
-    throw new Error(
-      'Alpha completed but did not return an output download URL.'
-    );
+    throw new Error('Alpha completed but did not return an output download URL.');
   }
 
-  return { outputUrl, jobId };
+  return {
+    outputUrl,
+    jobId
+  };
 }
 
 async function runAlpha(ctx, pending, targetFps) {
   const meta = await inspectMedia(pending.inputPath);
-
   const estimate = alphaEstimate(meta, targetFps);
 
   const status = await ctx.reply(
@@ -1437,12 +1345,7 @@ async function runAlpha(ctx, pending, targetFps) {
     );
 
     const caption =
-      `✅ Alpha completed\nOutput: 720p WMV\n` +
-      `${targetFps
-        ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n`
-        : 'FPS patch: Off\n'}` +
-      `Estimated duration: ${fmtTime(estimate.outputDuration)}\n` +
-      `Estimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
+      `✅ Alpha completed\nOutput: 720p WMV\n${targetFps ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` : 'FPS patch: Off\n'}Estimated duration: ${fmtTime(estimate.outputDuration)}\nEstimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
 
     await sendDocumentFile(
       ctx,
@@ -1457,10 +1360,7 @@ async function runAlpha(ctx, pending, targetFps) {
       true
     );
 
-    await removePendingVideo(
-      ctx.from.id,
-      pending
-    );
+    await removePendingVideo(ctx.from.id, pending);
 
   } catch (err) {
     await editProgress(
@@ -1480,82 +1380,32 @@ async function runAlpha(ctx, pending, targetFps) {
 }
 
 // Mini App
-
-const MINI_APP_URL = (
-  process.env.MINI_APP_URL ||
-  'https://fastidious-biscochitos-ad7934.netlify.app/'
-).trim();
+const MINI_APP_URL =
+  (process.env.MINI_APP_URL || 'https://fastidious-biscochitos-ad7934.netlify.app/').trim();
 
 const WELCOME_IMAGE = path.join(__dirname, 'image1.png');
 
-// Keyboards
-
 function mainKeyboard() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        '🟢 Enhanced Method',
-        'method:enhanced'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⚠️ HD Method',
-        'menu:hd'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⚡ Alpha',
-        'menu:alpha'
-      )
-    ]
+    [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
+    [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
+    [Markup.button.callback('⚡ Alpha', 'menu:alpha')],
   ]);
 }
 
 function hdKeyboard() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        '🌙 Luna — MP4Patcher',
-        'method:luna'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⚠️ Jarvis — Kuronai HQ',
-        'menu:jarvis'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⬅️ Back',
-        'menu:main'
-      )
-    ]
+    [Markup.button.callback('🌙 Luna — MP4Patcher', 'method:luna')],
+    [Markup.button.callback('⚠️ Jarvis — Kuronai HQ', 'menu:jarvis')],
+    [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
 function optimizerKeyboard() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        '🟢 Optimizer ON (re-encode)',
-        'jarvis:optimizer:on'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⚪ Optimizer OFF (no re-encode)',
-        'jarvis:optimizer:off'
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⬅️ Back',
-        'menu:hd'
-      )
-    ]
+    [Markup.button.callback('🟢 Optimizer ON (re-encode)', 'jarvis:optimizer:on')],
+    [Markup.button.callback('⚪ Optimizer OFF (no re-encode)', 'jarvis:optimizer:off')],
+    [Markup.button.callback('⬅️ Back', 'menu:hd')],
   ]);
 }
 
@@ -1564,7 +1414,7 @@ function alphaConfirmKeyboard() {
     [
       Markup.button.callback('✅ Yes', 'alpha:confirm'),
       Markup.button.callback('❌ No', 'menu:main')
-    ]
+    ],
   ]);
 }
 
@@ -1572,11 +1422,9 @@ function alphaPatchKeyboard() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback('✅ Yes', 'alpha:patch:yes'),
-      Markup.button.callback('❌ No', 'alpha:patch:no')
+      Markup.button.callback('❌ No', 'menu:main')
     ],
-    [
-      Markup.button.callback('⬅️ Back', 'menu:main')
-    ]
+    [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
@@ -1586,35 +1434,20 @@ function alphaFpsKeyboard() {
       Markup.button.callback('60 FPS', 'alpha:fps:60'),
       Markup.button.callback('30 FPS', 'alpha:fps:30')
     ],
-    [
-      Markup.button.callback('⬅️ Back', 'alpha:confirm')
-    ]
+    [Markup.button.callback('⬅️ Back', 'alpha:confirm')],
   ]);
 }
 
 function alphaStartKeyboard(fps) {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        '🚀 Start Alpha',
-        `alpha:start:${fps}`
-      )
-    ],
-    [
-      Markup.button.callback(
-        '⬅️ Back',
-        'alpha:patch:yes'
-      )
-    ]
+    [Markup.button.callback('🚀 Start Alpha', `alpha:start:${fps}`)],
+    [Markup.button.callback('⬅️ Back', 'alpha:patch:yes')],
   ]);
 }
 
-// Membership check button
-
-bot.action('membership:check', async ctx => {
-  await ctx.answerCbQuery(
-    'Checking your membership…'
-  ).catch(() => {});
+// Membership re-check button
+bot.action('membership:check', async (ctx) => {
+  await ctx.answerCbQuery('Checking your membership…').catch(() => {});
 
   try {
     const member = await ctx.telegram.getChatMember(
@@ -1630,18 +1463,8 @@ bot.action('membership:check', async ctx => {
       return ctx.reply(
         '❌ You have not joined @jv_60fps yet. Join the channel, then tap the check button again.',
         Markup.inlineKeyboard([
-          [
-            Markup.button.url(
-              '📢 Join JV-60FPS Channel',
-              REQUIRED_CHANNEL_URL
-            )
-          ],
-          [
-            Markup.button.callback(
-              '✅ Check Again',
-              'membership:check'
-            )
-          ]
+          [Markup.button.url('📢 Join JV-60FPS Channel', REQUIRED_CHANNEL_URL)],
+          [Markup.button.callback('✅ Check Again', 'membership:check')],
         ])
       );
     }
@@ -1652,10 +1475,7 @@ bot.action('membership:check', async ctx => {
     );
 
   } catch (err) {
-    console.error(
-      '[membership] Recheck failed:',
-      err.message
-    );
+    console.error('[membership] Recheck failed:', err.message);
 
     return ctx.reply(
       '⚠️ Could not verify membership. Please try again later. The bot must be an administrator in @jv_60fps.'
@@ -1663,13 +1483,10 @@ bot.action('membership:check', async ctx => {
   }
 });
 
-// Start and help
-
-bot.start(async ctx => {
+// Start and help commands
+bot.start(async (ctx) => {
   const text =
-    '👋 Welcome to JV Methods Bot\n\n' +
-    '🎬 Send me a video and choose a processing method.\n' +
-    '🔎 Send a TikTok link (or open the menu button at the left of the chat) for full video details and downloads.';
+    '👋 Welcome to JV Methods Bot\n\n🎬 Send me a video and choose a processing method.\n🔎 Send a TikTok link (or open the menu button at the left of the chat) for full video details and downloads.';
 
   if (fs.existsSync(WELCOME_IMAGE)) {
     try {
@@ -1678,41 +1495,31 @@ bot.start(async ctx => {
         { caption: text }
       );
     } catch (e) {
-      console.warn(
-        '[start] image failed:',
-        scrub(e.message)
-      );
+      console.warn('[start] image failed:', scrub(e.message));
     }
   }
 
   return ctx.reply(text);
 });
 
-bot.help(ctx =>
+bot.help((ctx) =>
   ctx.reply(
     'Send a video, then choose Enhanced, HD (Luna/Jarvis) or Alpha. Send a TikTok link, or use the menu button at the left of the chat, for the Checker & Downloader.'
   )
 );
 
-// Incoming videos
+// Receive videos
+bot.on(['video', 'document'], async (ctx) => {
+  const file = ctx.message.video || ctx.message.document;
 
-bot.on(['video', 'document'], async ctx => {
-  const file =
-    ctx.message.video ||
-    ctx.message.document;
-
-  if (
-    !file ||
-    (
-      ctx.message.document &&
-      !(file.mime_type || '').startsWith('video/')
-    )
-  ) {
+  if (!file || (
+    ctx.message.document &&
+    !(file.mime_type || '').startsWith('video/')
+  )) {
     return;
   }
 
-  const sizeMB =
-    (file.file_size || 0) / 1048576;
+  const sizeMB = (file.file_size || 0) / 1048576;
 
   if (sizeMB > MAX_VIDEO_MB) {
     return ctx.reply(
@@ -1726,10 +1533,7 @@ bot.on(['video', 'document'], async ctx => {
     );
   }
 
-  const status = await ctx.reply(
-    '📥 Downloading your video…'
-  );
-
+  const status = await ctx.reply('📥 Downloading your video…');
   let inputPath;
 
   try {
@@ -1739,21 +1543,15 @@ bot.on(['video', 'document'], async ctx => {
       ctx.from.id
     );
 
-    const previous =
-      pendingVideos.get(ctx.from.id);
+    const previous = pendingVideos.get(ctx.from.id);
 
     if (previous) {
-      await removePendingVideo(
-        ctx.from.id,
-        previous
-      );
+      await removePendingVideo(ctx.from.id, previous);
     }
 
     pendingVideos.set(ctx.from.id, {
       inputPath,
-      fileName: safeName(
-        file.file_name || 'video.mp4'
-      )
+      fileName: safeName(file.file_name || 'video.mp4')
     });
 
     await ctx.telegram.editMessageText(
@@ -1779,16 +1577,12 @@ bot.on(['video', 'document'], async ctx => {
 });
 
 // Menus
-
-bot.action('menu:main', async ctx => {
+bot.action('menu:main', async (ctx) => {
   await ctx.answerCbQuery();
-  return ctx.editMessageText(
-    'Choose a method:',
-    mainKeyboard()
-  );
+  return ctx.editMessageText('Choose a method:', mainKeyboard());
 });
 
-bot.action('menu:hd', async ctx => {
+bot.action('menu:hd', async (ctx) => {
   await ctx.answerCbQuery();
   return ctx.editMessageText(
     '⚠️ HD METHOD\nChoose a processing engine:',
@@ -1796,32 +1590,28 @@ bot.action('menu:hd', async ctx => {
   );
 });
 
-bot.action('menu:jarvis', async ctx => {
+bot.action('menu:jarvis', async (ctx) => {
   await ctx.answerCbQuery();
+
   return ctx.editMessageText(
     '⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\nChoose whether Kuronai should re-encode the video:',
     optimizerKeyboard()
   );
 });
 
-bot.action('menu:alpha', async ctx => {
+bot.action('menu:alpha', async (ctx) => {
   await ctx.answerCbQuery();
+
   return ctx.editMessageText(
     '⚡ Alpha\n\n720p output with optional 30 FPS or 60 FPS patching.\n\nDo you still want to use Alpha?',
     alphaConfirmKeyboard()
   );
 });
 
-// Pending videos
-
 async function getPending(ctx) {
   const p = pendingVideos.get(ctx.from.id);
 
-  if (
-    !p ||
-    !p.inputPath ||
-    !fs.existsSync(p.inputPath)
-  ) {
+  if (!p || !p.inputPath || !fs.existsSync(p.inputPath)) {
     await ctx.reply(
       '⚠️ Please send a video first, then choose the method.'
     );
@@ -1836,9 +1626,7 @@ function withBusy(ctx, fn) {
   const id = ctx.from.id;
 
   if (busyUsers.has(id)) {
-    return ctx.reply(
-      '⏳ You already have a processing task running.'
-    );
+    return ctx.reply('⏳ You already have a processing task running.');
   }
 
   busyUsers.add(id);
@@ -1864,41 +1652,31 @@ function withBusy(ctx, fn) {
 }
 
 // Method actions
-
-bot.action('method:enhanced', async ctx => {
+bot.action('method:enhanced', async (ctx) => {
   await ctx.answerCbQuery();
 
   return withBusy(ctx, async () => {
     const p = await getPending(ctx);
 
     if (p) {
-      await runKuronai(
-        ctx,
-        p,
-        'enhanced',
-        false
-      );
+      await runKuronai(ctx, p, 'enhanced', false);
     }
   });
 });
 
-bot.action('method:luna', async ctx => {
+bot.action('method:luna', async (ctx) => {
   await ctx.answerCbQuery();
 
   return withBusy(ctx, async () => {
     const p = await getPending(ctx);
 
     if (p) {
-      await runLocalMethod(
-        ctx,
-        p,
-        'luna'
-      );
+      await runLocalMethod(ctx, p, 'luna');
     }
   });
 });
 
-bot.action(/^jarvis:optimizer:(on|off)$/, async ctx => {
+bot.action(/^jarvis:optimizer:(on|off)$/, async (ctx) => {
   await ctx.answerCbQuery();
 
   return withBusy(ctx, async () => {
@@ -1915,7 +1693,7 @@ bot.action(/^jarvis:optimizer:(on|off)$/, async ctx => {
   });
 });
 
-bot.action('alpha:confirm', async ctx => {
+bot.action('alpha:confirm', async (ctx) => {
   await ctx.answerCbQuery();
 
   return ctx.editMessageText(
@@ -1924,7 +1702,7 @@ bot.action('alpha:confirm', async ctx => {
   );
 });
 
-bot.action('alpha:patch:yes', async ctx => {
+bot.action('alpha:patch:yes', async (ctx) => {
   await ctx.answerCbQuery();
 
   return ctx.editMessageText(
@@ -1933,7 +1711,7 @@ bot.action('alpha:patch:yes', async ctx => {
   );
 });
 
-bot.action('alpha:patch:no', async ctx => {
+bot.action('alpha:patch:no', async (ctx) => {
   await ctx.answerCbQuery();
 
   return withBusy(ctx, async () => {
@@ -1945,12 +1723,10 @@ bot.action('alpha:patch:no', async ctx => {
   });
 });
 
-bot.action(/^alpha:fps:(30|60)$/, async ctx => {
+bot.action(/^alpha:fps:(30|60)$/, async (ctx) => {
   const fps = Number(ctx.match[1]);
 
-  await ctx.answerCbQuery(
-    'Calculating estimate…'
-  );
+  await ctx.answerCbQuery('Calculating estimate…');
 
   const p = await getPending(ctx);
 
@@ -1961,14 +1737,7 @@ bot.action(/^alpha:fps:(30|60)$/, async ctx => {
     const estimate = alphaEstimate(meta, fps);
 
     const preview =
-      `⚡ Alpha\n\n` +
-      `Source FPS: ${estimate.sourceFps.toFixed(3)}\n` +
-      `Target FPS: ${fps}\n` +
-      `Timestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` +
-      `Estimated output duration: ${fmtTime(estimate.outputDuration)}\n` +
-      `Estimated output size: ${estimate.estimatedMB.toFixed(1)} MB\n` +
-      `Video bitrate: ${ALPHA_VIDEO_BITRATE}\n\n` +
-      `Start processing?`;
+      `⚡ Alpha\n\nSource FPS: ${estimate.sourceFps.toFixed(3)}\nTarget FPS: ${fps}\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\nEstimated output duration: ${fmtTime(estimate.outputDuration)}\nEstimated output size: ${estimate.estimatedMB.toFixed(1)} MB\nVideo bitrate: ${ALPHA_VIDEO_BITRATE}\n\nStart processing?`;
 
     return ctx.editMessageText(
       preview,
@@ -1982,7 +1751,7 @@ bot.action(/^alpha:fps:(30|60)$/, async ctx => {
   }
 });
 
-bot.action(/^alpha:start:(30|60)$/, async ctx => {
+bot.action(/^alpha:start:(30|60)$/, async (ctx) => {
   const fps = Number(ctx.match[1]);
 
   await ctx.answerCbQuery();
@@ -1996,16 +1765,10 @@ bot.action(/^alpha:start:(30|60)$/, async ctx => {
   });
 });
 
-// TikTok URL handling
-
 function validTikTokUrl(value) {
   try {
     const u = new URL(value);
-
-    return /(^|\.)tiktok\.com$/i.test(
-      u.hostname
-    );
-
+    return /(^|\.)tiktok\.com$/i.test(u.hostname);
   } catch (_) {
     return false;
   }
@@ -2018,10 +1781,8 @@ async function inspectMedia(filePath) {
       [
         '-v', 'error',
         '-select_streams', 'v:0',
-        '-show_entries',
-        'stream=codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate',
-        '-show_entries',
-        'format=duration,size,bit_rate',
+        '-show_entries', 'stream=codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate',
+        '-show_entries', 'format=duration,size,bit_rate',
         '-of', 'json',
         filePath
       ],
@@ -2036,16 +1797,15 @@ async function inspectMedia(filePath) {
         try {
           resolve(JSON.parse(stdout));
         } catch (_) {
-          reject(
-            new Error('Could not parse FFprobe media details.')
-          );
+          reject(new Error('Could not parse FFprobe media details.'));
         }
       }
     );
   });
 }
 
-bot.on('text', async ctx => {
+// TikTok link handoff to the Mini App
+bot.on('text', async (ctx) => {
   const text = (ctx.message.text || '').trim();
 
   if (!validTikTokUrl(text)) return;
@@ -2067,7 +1827,6 @@ bot.on('text', async ctx => {
 });
 
 // Error handling
-
 bot.catch((err, ctx) => {
   console.error(
     'Bot error:',
@@ -2081,8 +1840,7 @@ bot.catch((err, ctx) => {
   }
 });
 
-// Express server
-
+// Express server and webhook
 const app = express();
 
 app.use(express.json({ limit: '1mb' }));
@@ -2094,8 +1852,7 @@ app.get('/', (_req, res) => {
   });
 });
 
-// Alpha input URLs expire after one hour
-
+// Expire old Alpha input URLs
 setInterval(() => {
   for (const [token, entry] of alphaInputTokens) {
     if (entry.expiresAt < Date.now()) {
@@ -2104,6 +1861,7 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
+// Alpha input download route
 app.get('/alpha-input/:token', (req, res) => {
   const entry = alphaInputTokens.get(req.params.token);
 
@@ -2113,19 +1871,15 @@ app.get('/alpha-input/:token', (req, res) => {
     !fs.existsSync(entry.path)
   ) {
     alphaInputTokens.delete(req.params.token);
-
     return res.status(404).end('Not found');
   }
 
   res.setHeader('Cache-Control', 'no-store');
-  res.setHeader(
-    'Content-Type',
-    'application/octet-stream'
-  );
+  res.setHeader('Content-Type', 'application/octet-stream');
 
   return res.sendFile(
     entry.path,
-    err => {
+    (err) => {
       if (err && !res.headersSent) {
         res.status(500).end('File unavailable');
       }
@@ -2139,11 +1893,7 @@ app.listen(PORT, '0.0.0.0', async () => {
   console.log(`[server] Listening on ${PORT}`);
 
   console.log(
-    `[telegram] API root: ${TELEGRAM_API_ROOT}; ` +
-    `self-hosted: ${SELF_HOSTED}; ` +
-    `max video: ${MAX_VIDEO_MB} MB; ` +
-    `max upload: ${Math.round(MAX_UPLOAD_BYTES / 1048576)} MB; ` +
-    `cleanup token: ${CLEANUP_TOKEN ? 'configured' : 'missing'}`
+    `[telegram] API root: ${TELEGRAM_API_ROOT}; self-hosted: ${SELF_HOSTED}; max video: ${MAX_VIDEO_MB} MB; max upload: ${Math.round(MAX_UPLOAD_BYTES / 1048576)} MB; cleanup token: ${CLEANUP_TOKEN ? 'configured' : 'missing'}`
   );
 
   if (PUBLIC_URL) {
@@ -2178,6 +1928,7 @@ app.listen(PORT, '0.0.0.0', async () => {
     }
   ]);
 
+  // Mini App button at the left of the message box.
   if (/^https:\/\//i.test(MINI_APP_URL)) {
     try {
       await bot.telegram.callApi(
