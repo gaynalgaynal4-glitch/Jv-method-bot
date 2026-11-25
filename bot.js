@@ -13,7 +13,7 @@ const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const PORT = Number(process.env.PORT || 3000);
+const PORT =nChoose whether Kuronai should re-encode the video Number(process.env.PORT || 3000);
 const PUBLIC_URL = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
 const WEBHOOK_PATH = `/webhook/${process.env.WEBHOOK_SECRET || 'jv-bot'}`;
 const METHODS_DIR = path.join(__dirname, 'methods');
@@ -1387,24 +1387,24 @@ const WELCOME_IMAGE = path.join(__dirname, 'image1.png');
 
 function mainKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
-    [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
+    [Markup.button.callback('⭐ Enhanced Method', 'method:enhanced')],
+    [Markup.button.callback(' 🔥 HD Method', 'menu:hd')],
     [Markup.button.callback('⚡ Alpha', 'menu:alpha')],
   ]);
 }
 
 function hdKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🌙 Luna — MP4Patcher', 'method:luna')],
-    [Markup.button.callback('⚠️ Jarvis — Kuronai HQ', 'menu:jarvis')],
+    [Markup.button.callback('✨ Luna', 'method:luna')],
+    [Markup.button.callback('🚀 Jarvis', 'menu:jarvis')],
     [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
 function optimizerKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🟢 Optimizer ON (re-encode)', 'jarvis:optimizer:on')],
-    [Markup.button.callback('⚪ Optimizer OFF (no re-encode)', 'jarvis:optimizer:off')],
+    [Markup.button.callback('🟢 Optimizer ON ', 'jarvis:optimizer:on')],
+    [Markup.button.callback('⚪ Optimizer OFF)', 'jarvis:optimizer:off')],
     [Markup.button.callback('⬅️ Back', 'menu:hd')],
   ]);
 }
@@ -1585,7 +1585,7 @@ bot.action('menu:main', async (ctx) => {
 bot.action('menu:hd', async (ctx) => {
   await ctx.answerCbQuery();
   return ctx.editMessageText(
-    '⚠️ HD METHOD\nChoose a processing engine:',
+    '⚠️ HD METHOD\n HD Method will give ou granted 1080p 60fps use jasrvis best \nChoose a processing engine:',
     hdKeyboard()
   );
 });
@@ -1594,7 +1594,7 @@ bot.action('menu:jarvis', async (ctx) => {
   await ctx.answerCbQuery();
 
   return ctx.editMessageText(
-    '⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\nChoose whether Kuronai should re-encode the video:',
+    '⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\n Use this if you haven't exported from Handbrake or compressed the file yet. it adds a few layers of prosesing time:',
     optimizerKeyboard()
   );
 });
@@ -1603,7 +1603,7 @@ bot.action('menu:alpha', async (ctx) => {
   await ctx.answerCbQuery();
 
   return ctx.editMessageText(
-    '⚡ Alpha\n\n720p output with optional 30 FPS or 60 FPS patching.\n\nDo you still want to use Alpha?',
+    '⚡ Alpha\n\nIt will give you constant 720p 60fps or 30fps on tiktok also later tiktok can compress it.\n\nDo you still want to use Alpha?',
     alphaConfirmKeyboard()
   );
 });
