@@ -154,29 +154,59 @@ const seenUpdates = new Map();
 const UPDATE_DEDUPE_TTL_MS = 10 * 60 * 1000;
 const UPDATE_DEDUPE_MAX = 10000;
 
-bot.use(async (ctx, next) => {
-  const updateId = ctx.update && ctx.update.update_id;
+const INSTANCE_ID = crypto.randomBytes(3).toString('hex');
 
-  if (Number.isInteger(updateId)) {
+// One identity per user action. Using update_id alone is not enough: it differs when the same message
+// reaches the bot through two paths (cloud + self-hosted Bot API, or two Render instances).
+function updateKey(update) {
+  if (!update) return '';
+  const m = update.message || update.edited_message;
+  if (update.message && m.chat) return `m:${m.chat.id}:${m.message_id}`;
+  if (update.callback_query && update.callback_query.id) return `c:${update.callback_query.id}`;
+  return Number.isInteger(update.update_id) ? `u:${update.update_id}` : '';
+}
+
+async function claimUpdate(key) {
+  // Cross-instance / cross-restart guard. Needs Upstash; fails open if it is unavailable.
+  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) return true;
+  try {
+    const result = await Promise.race([
+      redisCommand(['SET', `jv-methods:seen:${key}`, INSTANCE_ID, 'NX', 'EX', '600']),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('dedupe timeout')), 1500))
+    ]);
+    return result !== null;
+  } catch (_) {
+    return true;
+  }
+}
+
+bot.use(async (ctx, next) => {
+  const key = updateKey(ctx.update);
+
+  if (key) {
     const now = Date.now();
 
     for (const [id, timestamp] of seenUpdates) {
-      if (now - timestamp > UPDATE_DEDUPE_TTL_MS) {
-        seenUpdates.delete(id);
-      }
+      if (now - timestamp > UPDATE_DEDUPE_TTL_MS) seenUpdates.delete(id);
     }
 
-    if (seenUpdates.has(updateId)) {
-      console.log(`[dedupe] Ignored duplicate Telegram update ${updateId}`);
+    if (seenUpdates.has(key)) {
+      console.log(`[dedupe] ${INSTANCE_ID} ignored duplicate ${key} (update ${ctx.update.update_id})`);
       return;
     }
 
-    seenUpdates.set(updateId, now);
+    seenUpdates.set(key, now);
 
     if (seenUpdates.size > UPDATE_DEDUPE_MAX) {
-      const oldest = seenUpdates.keys().next().value;
-      seenUpdates.delete(oldest);
+      seenUpdates.delete(seenUpdates.keys().next().value);
     }
+
+    if (!(await claimUpdate(key))) {
+      console.log(`[dedupe] ${INSTANCE_ID} ignored ${key}: already handled by another instance/path`);
+      return;
+    }
+
+    console.log(`[update] ${INSTANCE_ID} ${key}`);
   }
 
   return next();
@@ -1782,14 +1812,27 @@ async function getPending(ctx) {
   return p;
 }
 
+const busyInfo = new Map();
+
 function withBusy(ctx, fn) {
   const id = ctx.from.id;
+  const action = (ctx.callbackQuery && ctx.callbackQuery.data) || '';
 
   if (busyUsers.has(id)) {
-    return ctx.reply('⏳ You already have a processing task running.');
+    const info = busyInfo.get(id);
+
+    // Same button again within seconds = double tap or a duplicate delivery of the same tap.
+    // Ignore it silently instead of printing "already running" next to the task that just started.
+    if (info && action && info.action === action && Date.now() - info.at < 20000) {
+      console.log(`[busy] Ignored repeated "${action}" from ${id}`);
+      return;
+    }
+
+    return ctx.reply('⏳ You already have a processing task running. Please wait until it finishes.');
   }
 
   busyUsers.add(id);
+  busyInfo.set(id, { action, at: Date.now() });
 
   (async () => {
     try {
@@ -1809,6 +1852,7 @@ function withBusy(ctx, fn) {
 
     } finally {
       busyUsers.delete(id);
+      busyInfo.delete(id);
     }
   })();
 }
