@@ -48,34 +48,55 @@ async function redisCommand(command) {
       Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify(command)
+    body: JSON.stringify(command),
+    signal: AbortSignal.timeout(6000)
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.error) throw new Error(data.error || `Upstash request failed (${response.status})`);
   return data.result;
 }
 
-async function getMaintenance() {
-  const raw = await redisCommand(['GET', MAINTENANCE_KEY]);
-  let saved = {};
-  if (raw) {
-    try { saved = JSON.parse(raw); } catch (_) { saved = {}; }
+let maintenanceCache = { at: 0, value: { ...DEFAULT_MAINTENANCE } };
+let maintenanceWarnedAt = 0;
+
+// strict=true (admin page) throws on Redis problems. Normal bot use fails OPEN: if Upstash is
+// missing/down, methods stay available instead of every button showing "Something went wrong".
+async function getMaintenance(strict = false) {
+  if (!strict && Date.now() - maintenanceCache.at < 5000) return maintenanceCache.value;
+  try {
+    const raw = await redisCommand(['GET', MAINTENANCE_KEY]);
+    let saved = {};
+    if (raw) {
+      try { saved = JSON.parse(raw); } catch (_) { saved = {}; }
+    }
+    const value = Object.fromEntries(METHOD_KEYS.map(key => [key, saved[key] === true]));
+    maintenanceCache = { at: Date.now(), value };
+    return value;
+  } catch (err) {
+    if (strict) throw err;
+    if (Date.now() - maintenanceWarnedAt > 60000) {
+      maintenanceWarnedAt = Date.now();
+      console.warn('[maintenance] Redis unavailable, using last known settings:', scrub(err.message));
+    }
+    maintenanceCache.at = Date.now() - 3000;   // retry in ~2 s
+    return maintenanceCache.value;
   }
-  return Object.fromEntries(METHOD_KEYS.map(key => [key, saved[key] === true]));
 }
 
 async function setMaintenance(method, enabled) {
   if (!METHOD_KEYS.includes(method)) throw new Error('Unknown method.');
-  const current = await getMaintenance();
+  const current = await getMaintenance(true);
   current[method] = enabled === true;
   await redisCommand(['SET', MAINTENANCE_KEY, JSON.stringify(current)]);
+  maintenanceCache = { at: Date.now(), value: { ...current } };
   return current;
 }
 
 function isAdminRequest(req) {
   if (!ADMIN_TOKEN) return false;
   const supplied = req.get('authorization')?.replace(/^Bearer\s+/i, '') || req.query.token || '';
-  return supplied.length === ADMIN_TOKEN.length && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(ADMIN_TOKEN));
+  const a = Buffer.from(String(supplied)), b = Buffer.from(ADMIN_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 const TIKWM_HOSTS = (process.env.TIKWM_API_BASE || 'https://www.tikwm.com,https://tikwm.com')
@@ -158,6 +179,15 @@ bot.use(async (ctx, next) => {
     }
   }
 
+  return next();
+});
+
+// A stale button ("query is too old") must never turn into a user-facing error.
+bot.use((ctx, next) => {
+  if (ctx.callbackQuery) {
+    const original = ctx.answerCbQuery.bind(ctx);
+    ctx.answerCbQuery = (...args) => original(...args).catch(() => {});
+  }
   return next();
 });
 
@@ -697,6 +727,68 @@ async function sendDocumentFile(ctx, filePath, caption) {
   );
 }
 
+// ---- Kuronai error handling: every failure becomes one consistent message ----
+class KuronaiError extends Error {
+  constructor(stage, message, { code = '', http = 0 } = {}) {
+    super(message);
+    this.name = 'KuronaiError';
+    this.stage = stage;
+    this.code = code ? String(code).slice(0, 60) : '';
+    this.http = http || 0;
+  }
+}
+
+// Kuronai (FastAPI) may answer with a string, {msg}, [{loc,msg}], {message|error|detail}, HTML or plain text.
+function kuronaiDetail(value, depth = 0) {
+  if (value == null || depth > 3) return '';
+  if (typeof value === 'string') {
+    const text = value.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    return text.slice(0, 300);
+  }
+  if (Array.isArray(value)) return value.map(v => kuronaiDetail(v, depth + 1)).filter(Boolean).slice(0, 3).join('; ');
+  if (typeof value === 'object') {
+    for (const key of ['message', 'msg', 'detail', 'error', 'reason', 'description']) {
+      const found = kuronaiDetail(value[key], depth + 1);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
+function kuronaiFriendly(http, text) {
+  const t = String(text || '').toLowerCase();
+  if (http === 413 || /too large|file size|exceeds/.test(t)) return 'The video is too large for this method.';
+  if (http === 429 || /rate limit|too many|busy|queue/.test(t)) return 'The server is busy right now. Please wait a minute and try again.';
+  if (http === 401 || http === 403) return 'The server refused the request (access denied).';
+  if (http === 400 || http === 415 || http === 422 || /unsupported|invalid|corrupt|codec|format/.test(t)) return 'The server could not read this video. Try another file or export it again.';
+  if (http >= 500 || /timed? ?out|unavailable|bad gateway|overload/.test(t)) return 'The processing server is temporarily unavailable.';
+  return '';
+}
+
+async function kuronaiHttpError(stage, response) {
+  let body = '';
+  try { body = await response.text(); } catch (_) {}
+  let detail = '';
+  try { detail = kuronaiDetail(JSON.parse(body)); } catch (_) { detail = kuronaiDetail(body); }
+  const friendly = kuronaiFriendly(response.status, detail);
+  const message = friendly || detail || 'The server returned an unexpected response.';
+  return new KuronaiError(stage, friendly && detail ? `${friendly}\nServer said: ${detail}` : message, { http: response.status });
+}
+
+function kuronaiNetworkError(stage, err) {
+  const cause = err && err.cause && (err.cause.code || err.cause.message) || '';
+  const timeout = /timeout|aborted/i.test(String(err && err.name) + String(err && err.message) + cause);
+  return new KuronaiError(stage, timeout ? 'The server took too long to respond.' : 'Could not reach the processing server.', { code: cause || (err && err.name) });
+}
+
+// Final text shown to the user (always the same layout).
+function formatKuronaiFailure(title, err, fallbackStage) {
+  const stage = (err && err.stage) || fallbackStage;
+  const reason = scrub(err && err.message || 'Unknown error').slice(0, 700);
+  const code = err && (err.http ? `HTTP ${err.http}` : err.code) || '';
+  return `❌ ${title} failed\n\nStage: ${stage}\nReason: ${reason}${code ? `\nCode: ${code}` : ''}\n\nYour original video is still available. Choose a method to try again.`;
+}
+
 // Kuronai upload protocol
 async function kuronaiUpload(
   inputPath,
@@ -722,26 +814,15 @@ async function kuronaiUpload(
     form.append('encode_video', String(Boolean(encodeVideo)));
   }
 
-  const response = await fetch(
-    KURONAI_API + route,
-    {
-      method: 'POST',
-      body: form
-    }
-  );
+  let response;
 
-  if (!response.ok) {
-    let detail = '';
-
-    try {
-      const j = await response.json();
-      detail = j.detail || j.message || '';
-    } catch (_) {}
-
-    throw new Error(
-      detail || `Kuronai upload failed (HTTP ${response.status}).`
-    );
+  try {
+    response = await fetch(KURONAI_API + route, { method: 'POST', body: form });
+  } catch (err) {
+    throw kuronaiNetworkError('Upload', err);
   }
+
+  if (!response.ok) throw await kuronaiHttpError('Upload', response);
 
   const contentType = response.headers.get('content-type') || '';
   let result = null;
@@ -774,8 +855,10 @@ async function kuronaiUpload(
         }
 
         if (event.type === 'error') {
-          throw new Error(
-            event.message || event.code || 'Kuronai server processing failed.'
+          throw new KuronaiError(
+            'Server processing',
+            kuronaiFriendly(0, kuronaiDetail(event)) || kuronaiDetail(event) || 'The server could not process this video.',
+            { code: typeof event.code === 'string' || typeof event.code === 'number' ? event.code : '' }
           );
         }
 
@@ -804,37 +887,36 @@ async function kuronaiUpload(
         }
 
         if (event.type === 'error') {
-          throw new Error(event.message || event.code);
+          throw new KuronaiError('Server processing', kuronaiDetail(event) || 'The server could not process this video.', { code: event.code });
         }
 
       } catch (e) {
-        if (e.message && !e.message.includes('Unexpected')) {
-          throw e;
-        }
+        if (e instanceof KuronaiError) throw e;
       }
     }
 
   } else {
-    result = await response.json();
+    result = await response.json().catch(() => null);
   }
 
   if (!result || typeof result.file_id !== 'string' || !result.file_id) {
-    throw new Error('Kuronai response did not contain a file_id.');
+    throw new KuronaiError('Server processing', 'The server finished but did not return a result file.');
   }
 
   return result.file_id;
 }
 
 async function kuronaiDownload(fileId, outputPath, onProgress) {
-  const response = await fetch(
-    `${KURONAI_API}/download/${encodeURIComponent(fileId)}`
-  );
+  let response;
 
-  if (!response.ok || !response.body) {
-    throw new Error(
-      `Kuronai result download failed (HTTP ${response.status}).`
-    );
+  try {
+    response = await fetch(`${KURONAI_API}/download/${encodeURIComponent(fileId)}`);
+  } catch (err) {
+    throw kuronaiNetworkError('Result download', err);
   }
+
+  if (!response.ok) throw await kuronaiHttpError('Result download', response);
+  if (!response.body) throw new KuronaiError('Result download', 'The server sent an empty response.');
 
   const total = Number(response.headers.get('content-length') || 0);
   const out = fs.createWriteStream(outputPath);
@@ -855,7 +937,7 @@ async function kuronaiDownload(fileId, outputPath, onProgress) {
   await new Promise(r => out.end(r));
 
   if (!received) {
-    throw new Error('Kuronai returned an empty output file.');
+    throw new KuronaiError('Result download', 'The server returned an empty output file.');
   }
 }
 
@@ -886,6 +968,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   let lastStage = 'Uploading';
   let processing = true;
   let inflight = Promise.resolve();
+  let stage = 'Upload';
 
   const progressText = (pct) =>
     `⚙️ ${title}\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: ${pct}\nStage: ${lastStage}\nElapsed: ${fmtTime(Date.now() - started)}`;
@@ -939,6 +1022,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     );
 
     await stopProgress();
+    stage = 'Result download';
 
     await editProgress(
       ctx,
@@ -972,6 +1056,8 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
       true
     );
 
+    stage = 'Telegram delivery';
+
     const delivery = await sendVideoFile(
       ctx,
       outputPath,
@@ -998,10 +1084,11 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
     await editProgress(
       ctx,
       status.message_id,
-      `❌ ${title} delivery failed\n${scrub(err.message || err).slice(0, 1200)}\n\nYour original video is still available. Please try again later.`,
+      formatKuronaiFailure(title, err, stage),
       true
     );
 
+    err.__reported = true;
     throw err;
 
   } finally {
@@ -1073,6 +1160,7 @@ async function runLocalMethod(ctx, pending, methodKey) {
       `❌ Processing failed: ${scrub(err.message)}`
     ).catch(() => {});
 
+    err.__reported = true;
     throw err;
 
   } finally {
@@ -1423,6 +1511,7 @@ async function runAlpha(ctx, pending, targetFps) {
       true
     );
 
+    err.__reported = true;
     throw err;
 
   } finally {
@@ -1712,9 +1801,11 @@ function withBusy(ctx, fn) {
         scrub(err && err.stack || err)
       );
 
-      await ctx.reply(
-        `❌ ${scrub(err && err.message || 'Operation failed.')}`
-      ).catch(() => {});
+      if (!(err && err.__reported)) {
+        await ctx.reply(
+          `❌ ${scrub(err && err.message || 'Operation failed.')}`
+        ).catch(() => {});
+      }
 
     } finally {
       busyUsers.delete(id);
@@ -1921,6 +2012,8 @@ bot.on('text', async (ctx) => {
 
 // Error handling
 bot.catch((err, ctx) => {
+  const benign = String(err && err.message || err);
+  if (/message is not modified|query is too old|query ID is invalid/i.test(benign)) return;
   console.error(
     'Bot error:',
     scrub(err && err.stack || err)
@@ -1932,6 +2025,9 @@ bot.catch((err, ctx) => {
     ).catch(() => {});
   }
 });
+
+process.on('unhandledRejection', (reason) => console.error('[unhandledRejection]', scrub(reason && reason.stack || reason)));
+process.on('uncaughtException', (err) => console.error('[uncaughtException]', scrub(err && err.stack || err)));
 
 // Express server and webhook
 const app = express();
@@ -1945,8 +2041,9 @@ const maintenanceHtml = `<!doctype html>
 <script>
 const token=new URLSearchParams(location.search).get('token')||'';
 const names={enhanced:'Enhanced Method',jarvis:'Jarvis',luna:'Luna',alpha:'Alpha'};
-async function api(method,body){const r=await fetch('/api/maintenance',{method,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed');return d;}
-function draw(data){document.getElementById('items').innerHTML=Object.entries(names).map(([key,name])=>'<div class="item"><div><div class="name">'+name+'</div><div class="state">'+(data[key]?'Under maintenance':'Available')+'</div></div><button class="'+(data[key]?'on':'')+'" onclick="toggle(\''+key+'\','+(!data[key])+')">'+(data[key]?'Turn OFF':'Turn ON')+'</button></div>').join('');}
+async function api(method,body){const r=await fetch('/api/maintenance',{method,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json().catch(function(){return {};});if(!r.ok)throw new Error(d.error||'Request failed');return d;}
+function draw(data){document.getElementById('items').innerHTML=Object.entries(names).map(function(e){var key=e[0],name=e[1],on=data[key]===true;return '<div class="item"><div><div class="name">'+name+'</div><div class="state">'+(on?'Under maintenance':'Available')+'</div></div><button data-key="'+key+'" data-enabled="'+(!on)+'" class="'+(on?'on':'')+'">'+(on?'Turn OFF':'Turn ON')+'</button></div>';}).join('');}
+document.getElementById('items').addEventListener('click',function(ev){var b=ev.target.closest('button[data-key]');if(b)toggle(b.dataset.key,b.dataset.enabled==='true');});
 async function load(){try{const d=await api('GET');draw(d.settings);document.getElementById('status').textContent='Connected · Settings saved';}catch(e){document.getElementById('status').textContent=e.message;}}
 async function toggle(key,enabled){document.getElementById('status').textContent='Saving…';try{const d=await api('POST',{method:key,enabled});draw(d.settings);document.getElementById('status').textContent='Saved successfully';}catch(e){document.getElementById('status').textContent=e.message;}}
 load();
@@ -1960,7 +2057,7 @@ app.get('/maintenance', (req, res) => {
 
 app.get('/api/maintenance', async (req, res) => {
   if (!isAdminRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
-  try { return res.json({ settings: await getMaintenance() }); }
+  try { return res.json({ settings: await getMaintenance(true) }); }
   catch (err) { return res.status(503).json({ error: scrub(err.message) }); }
 });
 
@@ -2053,7 +2150,7 @@ app.listen(PORT, '0.0.0.0', async () => {
       command: 'help',
       description: 'How to use the bot'
     }
-  ]);
+  ]).catch(err => console.error('[bot] setMyCommands failed:', scrub(err.message)));
 
   // Mini App button at the left of the message box.
   if (/^https:\/\//i.test(MINI_APP_URL)) {
