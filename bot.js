@@ -31,6 +31,53 @@ const TELEGRAM_API_ROOT =
 
 const CLEANUP_TOKEN = process.env.CLEANUP_TOKEN || '';
 
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const UPSTASH_REDIS_REST_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const MAINTENANCE_KEY = 'jv-methods:maintenance:v1';
+const METHOD_KEYS = ['enhanced', 'jarvis', 'luna', 'alpha'];
+const DEFAULT_MAINTENANCE = { enhanced: false, jarvis: false, luna: false, alpha: false };
+
+async function redisCommand(command) {
+  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+    throw new Error('Upstash Redis is not configured. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.');
+  }
+  const response = await fetch(UPSTASH_REDIS_REST_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(command)
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) throw new Error(data.error || `Upstash request failed (${response.status})`);
+  return data.result;
+}
+
+async function getMaintenance() {
+  const raw = await redisCommand(['GET', MAINTENANCE_KEY]);
+  let saved = {};
+  if (raw) {
+    try { saved = JSON.parse(raw); } catch (_) { saved = {}; }
+  }
+  return Object.fromEntries(METHOD_KEYS.map(key => [key, saved[key] === true]));
+}
+
+async function setMaintenance(method, enabled) {
+  if (!METHOD_KEYS.includes(method)) throw new Error('Unknown method.');
+  const current = await getMaintenance();
+  current[method] = enabled === true;
+  await redisCommand(['SET', MAINTENANCE_KEY, JSON.stringify(current)]);
+  return current;
+}
+
+function isAdminRequest(req) {
+  if (!ADMIN_TOKEN) return false;
+  const supplied = req.get('authorization')?.replace(/^Bearer\s+/i, '') || req.query.token || '';
+  return supplied.length === ADMIN_TOKEN.length && crypto.timingSafeEqual(Buffer.from(supplied), Buffer.from(ADMIN_TOKEN));
+}
+
 const TIKWM_HOSTS = (process.env.TIKWM_API_BASE || 'https://www.tikwm.com,https://tikwm.com')
   .split(',')
   .map(h => h.trim().replace(/\/$/, ''))
@@ -185,10 +232,10 @@ const METHODS = {
     route: '/uploaden/'
   },
   luna: {
-    label: '🌙 Luna (MP4Patcher)'
+    label: '🌙 Luna'
   },
   jarvis: {
-    label: '⚠️ Jarvis (Kuronai HQ)'
+    label: '⚠️ Jarvis'
   },
   alpha: {
     label: '⚡ Alpha'
@@ -822,9 +869,11 @@ async function kuronaiCleanup(fileId) {
 }
 
 async function runKuronai(ctx, pending, mode, encodeVideo) {
+  const maintenance = await getMaintenance();
+  if (maintenance[mode]) throw new Error(`${mode === 'enhanced' ? 'Enhanced Method' : 'Jarvis'} is currently under maintenance.`);
   const enhanced = mode === 'enhanced';
   const route = enhanced ? '/uploaden/' : '/upload/';
-  const title = enhanced ? 'Enhanced Method' : 'Jarvis HQ Method';
+  const title = enhanced ? 'Enhanced Method' : 'Jarvis';
   const started = Date.now();
 
   const status = await ctx.reply(
@@ -970,6 +1019,8 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
 }
 
 async function runLocalMethod(ctx, pending, methodKey) {
+  const maintenance = await getMaintenance();
+  if (maintenance[methodKey]) throw new Error('Luna is currently under maintenance.');
   const userId = ctx.from.id;
 
   const outputPath = tempPath(
@@ -1288,6 +1339,8 @@ async function createAlphaJob(
 }
 
 async function runAlpha(ctx, pending, targetFps) {
+  const maintenance = await getMaintenance();
+  if (maintenance.alpha) throw new Error('Alpha is currently under maintenance.');
   const meta = await inspectMedia(pending.inputPath);
   const estimate = alphaEstimate(meta, targetFps);
 
@@ -1387,25 +1440,33 @@ const WELCOME_IMAGE = path.join(__dirname, 'image1.png');
 
 function mainKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🟢 Enhanced Method', 'method:enhanced')],
+    [Markup.button.callback('🟢 Enhanced', 'method:enhanced:info')],
     [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
     [Markup.button.callback('⚡ Alpha', 'menu:alpha')],
   ]);
 }
 
-function hdKeyboard() {
+function hdKeyboard(maintenance = DEFAULT_MAINTENANCE) {
+  const label = (key, title) => `${maintenance[key] ? '🛠 ' : ''}${title}${maintenance[key] ? ' (Maintenance)' : ''}`;
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🌙 Luna — MP4Patcher', 'method:luna')],
-    [Markup.button.callback('⚠️ Jarvis — Kuronai HQ', 'menu:jarvis')],
+    [Markup.button.callback(label('jarvis', '⚠️ Jarvis'), 'menu:jarvis')],
+    [Markup.button.callback(label('luna', '🌙 Luna'), 'method:luna:info')],
     [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
 function optimizerKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🟢 Optimizer ON (re-encode)', 'jarvis:optimizer:on')],
-    [Markup.button.callback('⚪ Optimizer OFF (no re-encode)', 'jarvis:optimizer:off')],
+    [Markup.button.callback('🟢 Optimizer ON', 'jarvis:optimizer:on')],
+    [Markup.button.callback('⚪ Optimizer OFF', 'jarvis:optimizer:off')],
     [Markup.button.callback('⬅️ Back', 'menu:hd')],
+  ]);
+}
+
+function methodInfoKeyboard(method) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback(method === 'luna' ? '🚀 Run Process' : '🚀 Continue', `method:${method}:run`)],
+    [Markup.button.callback('⬅️ Back', method === 'luna' ? 'menu:hd' : 'menu:main')],
   ]);
 }
 
@@ -1584,17 +1645,25 @@ bot.action('menu:main', async (ctx) => {
 
 bot.action('menu:hd', async (ctx) => {
   await ctx.answerCbQuery();
-  return ctx.editMessageText(
-    '⚠️ HD METHOD\nChoose a processing engine:',
-    hdKeyboard()
-  );
+  try {
+    const maintenance = await getMaintenance();
+    return ctx.editMessageText(
+      'HD Method gives you up to 1080p 60fps with Jarvis.',
+      hdKeyboard(maintenance)
+    );
+  } catch (err) {
+    console.error('[maintenance] Read failed:', scrub(err.message));
+    return ctx.editMessageText('Methods are temporarily unavailable. Please try again later.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
+  }
 });
 
 bot.action('menu:jarvis', async (ctx) => {
   await ctx.answerCbQuery();
 
+  const maintenance = await getMaintenance();
+  if (maintenance.jarvis) return ctx.editMessageText('🛠 Jarvis is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]]));
   return ctx.editMessageText(
-    '⚠️ JARVIS — HQ METHOD\n\nVideo Optimization\nChoose whether Kuronai should re-encode the video:',
+    'Optimizer\nUse this if you have not exported from HandBrake or compressed the file yet.',
     optimizerKeyboard()
   );
 });
@@ -1602,8 +1671,10 @@ bot.action('menu:jarvis', async (ctx) => {
 bot.action('menu:alpha', async (ctx) => {
   await ctx.answerCbQuery();
 
+  const maintenance = await getMaintenance();
+  if (maintenance.alpha) return ctx.editMessageText('🛠 Alpha is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
   return ctx.editMessageText(
-    '⚡ Alpha\n\n720p output with optional 30 FPS or 60 FPS patching.\n\nDo you still want to use Alpha?',
+    'Alpha can give you up to 720p 60fps or 30fps, depending on your choice. TikTok can still compress your video later, so HD Method is recommended.',
     alphaConfirmKeyboard()
   );
 });
@@ -1651,50 +1722,71 @@ function withBusy(ctx, fn) {
   })();
 }
 
-// Method actions
-bot.action('method:enhanced', async (ctx) => {
+// Method information and confirmation screens
+bot.action('method:enhanced:info', async (ctx) => {
   await ctx.answerCbQuery();
+  const maintenance = await getMaintenance();
+  if (maintenance.enhanced) return ctx.editMessageText('🛠 Enhanced Method is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
+  return ctx.editMessageText(
+    'Enhanced Method can give you up to 1080p 60fps or 30fps. TikTok decides the final quality and may compress the video.',
+    methodInfoKeyboard('enhanced')
+  );
+});
 
+bot.action('method:enhanced:run', async (ctx) => {
+  await ctx.answerCbQuery();
   return withBusy(ctx, async () => {
+    const maintenance = await getMaintenance();
+    if (maintenance.enhanced) return ctx.reply('🛠 Enhanced Method is currently under maintenance.');
     const p = await getPending(ctx);
-
-    if (p) {
-      await runKuronai(ctx, p, 'enhanced', false);
-    }
+    if (p) await runKuronai(ctx, p, 'enhanced', false);
   });
 });
 
-bot.action('method:luna', async (ctx) => {
+bot.action('method:luna:info', async (ctx) => {
   await ctx.answerCbQuery();
+  const maintenance = await getMaintenance();
+  if (maintenance.luna) return ctx.editMessageText('🛠 Luna is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]]));
+  return ctx.editMessageText('Luna', methodInfoKeyboard('luna'));
+});
 
+bot.action('method:luna:run', async (ctx) => {
+  await ctx.answerCbQuery();
   return withBusy(ctx, async () => {
+    const maintenance = await getMaintenance();
+    if (maintenance.luna) return ctx.reply('🛠 Luna is currently under maintenance.');
     const p = await getPending(ctx);
-
-    if (p) {
-      await runLocalMethod(ctx, p, 'luna');
-    }
+    if (p) await runLocalMethod(ctx, p, 'luna');
   });
 });
 
 bot.action(/^jarvis:optimizer:(on|off)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  const maintenance = await getMaintenance();
+  if (maintenance.jarvis) return ctx.editMessageText('🛠 Jarvis is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]]));
+  const enabled = ctx.match[1] === 'on';
+  return ctx.editMessageText(
+    `Jarvis selected\nOptimizer: ${enabled ? 'ON (re-encode)' : 'OFF (no re-encode)'}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🚀 Run Jarvis', `jarvis:run:${enabled ? 'on' : 'off'}`)],
+      [Markup.button.callback('⬅️ Back', 'menu:jarvis')]
+    ])
+  );
+});
 
+bot.action(/^jarvis:run:(on|off)$/, async (ctx) => {
+  await ctx.answerCbQuery();
   return withBusy(ctx, async () => {
+    const maintenance = await getMaintenance();
+    if (maintenance.jarvis) return ctx.reply('🛠 Jarvis is currently under maintenance.');
     const p = await getPending(ctx);
-
-    if (p) {
-      await runKuronai(
-        ctx,
-        p,
-        'jarvis',
-        ctx.match[1] === 'on'
-      );
-    }
+    if (p) await runKuronai(ctx, p, 'jarvis', ctx.match[1] === 'on');
   });
 });
 
 bot.action('alpha:confirm', async (ctx) => {
   await ctx.answerCbQuery();
+  if ((await getMaintenance()).alpha) return ctx.reply('🛠 Alpha is currently under maintenance.');
 
   return ctx.editMessageText(
     '⚡ Alpha\n\nDo you want to patch FPS?',
@@ -1753,6 +1845,7 @@ bot.action(/^alpha:fps:(30|60)$/, async (ctx) => {
 
 bot.action(/^alpha:start:(30|60)$/, async (ctx) => {
   const fps = Number(ctx.match[1]);
+  if ((await getMaintenance()).alpha) { await ctx.answerCbQuery('Alpha is under maintenance.', { show_alert: true }); return; }
 
   await ctx.answerCbQuery();
 
@@ -1844,6 +1937,40 @@ bot.catch((err, ctx) => {
 const app = express();
 
 app.use(express.json({ limit: '1mb' }));
+
+const maintenanceHtml = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>JV Methods Maintenance</title>
+<style>body{font:16px system-ui;background:#101522;color:#eef2ff;margin:0;padding:24px}.wrap{max-width:620px;margin:auto}h1{font-size:23px}.sub{color:#aab5cc}.item{display:flex;align-items:center;justify-content:space-between;background:#1b2538;padding:16px;border-radius:12px;margin:12px 0}.name{font-weight:650}.state{font-size:13px;color:#aab5cc;margin-top:4px}button{border:0;border-radius:22px;padding:10px 16px;font-weight:700;background:#334155;color:white}button.on{background:#b45309}#status{color:#9ca3af;margin-top:18px}</style></head>
+<body><div class="wrap"><h1>JV Methods — Maintenance</h1><p class="sub">Changes are saved to Upstash Redis and survive Render restarts and deployments.</p><div id="items"></div><div id="status">Loading settings…</div></div>
+<script>
+const token=new URLSearchParams(location.search).get('token')||'';
+const names={enhanced:'Enhanced Method',jarvis:'Jarvis',luna:'Luna',alpha:'Alpha'};
+async function api(method,body){const r=await fetch('/api/maintenance',{method,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw new Error(d.error||'Request failed');return d;}
+function draw(data){document.getElementById('items').innerHTML=Object.entries(names).map(([key,name])=>'<div class="item"><div><div class="name">'+name+'</div><div class="state">'+(data[key]?'Under maintenance':'Available')+'</div></div><button class="'+(data[key]?'on':'')+'" onclick="toggle(\''+key+'\','+(!data[key])+')">'+(data[key]?'Turn OFF':'Turn ON')+'</button></div>').join('');}
+async function load(){try{const d=await api('GET');draw(d.settings);document.getElementById('status').textContent='Connected · Settings saved';}catch(e){document.getElementById('status').textContent=e.message;}}
+async function toggle(key,enabled){document.getElementById('status').textContent='Saving…';try{const d=await api('POST',{method:key,enabled});draw(d.settings);document.getElementById('status').textContent='Saved successfully';}catch(e){document.getElementById('status').textContent=e.message;}}
+load();
+</script></body></html>`;
+
+app.get('/maintenance', (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).type('text').send('Unauthorized. Open this page with your ADMIN_TOKEN as ?token=…');
+  res.setHeader('Cache-Control', 'no-store');
+  return res.type('html').send(maintenanceHtml);
+});
+
+app.get('/api/maintenance', async (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+  try { return res.json({ settings: await getMaintenance() }); }
+  catch (err) { return res.status(503).json({ error: scrub(err.message) }); }
+});
+
+app.post('/api/maintenance', async (req, res) => {
+  if (!isAdminRequest(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const { method, enabled } = req.body || {};
+  if (!METHOD_KEYS.includes(method) || typeof enabled !== 'boolean') return res.status(400).json({ error: 'Invalid method or enabled value' });
+  try { return res.json({ settings: await setMaintenance(method, enabled) }); }
+  catch (err) { return res.status(503).json({ error: scrub(err.message) }); }
+});
 
 app.get('/', (_req, res) => {
   res.json({

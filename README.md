@@ -9,13 +9,20 @@
 - **Checker & Downloader**: TikWM metadata, region field where returned, standard/HD download links, original-quality task flow, and native FFprobe inspection of the downloaded stream.
 
 ## Deploy
-1. Use Node.js 18 or newer.
+1. Use Node.js 20 or newer.
 2. Set `BOT_TOKEN` to your Telegram bot token.
 3. Set `XORA_API_KEY` to your private API key.
 4. Set `RENDER_EXTERNAL_URL` (automatically provided by Render) or `PUBLIC_URL` to the public HTTPS service URL; Alpha exposes a short-lived, random input URL so the cloud processor can fetch the Telegram upload.
 5. Optional: set `ALPHA_VIDEO_BITRATE` (default `18M`, use `15M`–`20M`), `ALPHA_AUDIO_BITRATE` (default `128k`), `ALPHA_JOB_TIMEOUT_MS` (default 900000), `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, or `FFPROBE_PATH`.
 6. Run `npm install` then `npm start`.
-7. Deploy as a Render Web Service, not a static site.
+7. Set `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and a long random `ADMIN_TOKEN` in Render Environment. These are required for persistent maintenance controls.
+8. Deploy as a Render Web Service, not a static site.
+
+## Maintenance dashboard
+- Open `https://YOUR-RENDER-SERVICE.onrender.com/maintenance?token=YOUR_ADMIN_TOKEN`.
+- Toggle Enhanced, Jarvis, Luna, or Alpha ON/OFF. ON blocks new processing and displays an under-maintenance message; OFF re-enables the method.
+- Settings are stored in Upstash Redis under `jv-methods:maintenance:v1`, so they survive Render spin-downs, restarts, and redeployments.
+- Keep `ADMIN_TOKEN` private. Use a long random value and do not commit your real `.env` file.
 
 ## Alpha setup
 - Add `XORA_API_KEY` in Render Environment. The bot sends the Telegram upload to a short-lived, random HTTPS endpoint on this service, submits a custom FFmpeg job, polls until it finishes, downloads the WMV output, and sends it back.
