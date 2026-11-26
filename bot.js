@@ -26,6 +26,10 @@ const REQUIRED_CHANNEL_URL = process.env.REQUIRED_CHANNEL_URL || 'https://t.me/j
 
 const KURONAI_API = 'https://api.kuronaiapp.com';
 
+// Netlify TikTok checker backend. Set both values in the bot host environment.
+const TIKTOK_API_URL = (process.env.TIKTOK_API_URL || '').replace(/\/$/, '');
+const TIKTOK_API_SECRET = process.env.TIKTOK_API_SECRET || process.env.API_SECRET || '';
+
 const TELEGRAM_API_ROOT =
   (process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org').replace(/\/$/, '');
 
@@ -2032,26 +2036,137 @@ async function inspectMedia(filePath) {
   });
 }
 
-// TikTok link handoff to the Mini App
+// TikTok links are processed by the external Netlify backend and returned in Telegram.
+// The bot no longer opens the HTML Mini App for incoming TikTok URLs.
+function formatCount(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return String(value || 0);
+  return n.toLocaleString('en-US');
+}
+
+function formatDuration(value) {
+  const seconds = Math.max(0, Math.floor(Number(value || 0)));
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const sec = seconds % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+async function requestTikTokBackend(action, url) {
+  if (!TIKTOK_API_URL) {
+    throw new Error('TikTok backend is not configured. Set TIKTOK_API_URL in the bot environment.');
+  }
+
+  const headers = { 'content-type': 'application/json' };
+  if (TIKTOK_API_SECRET) headers.authorization = `Bearer ${TIKTOK_API_SECRET}`;
+
+  const response = await fetch(TIKTOK_API_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ action, url }),
+    signal: AbortSignal.timeout(55000)
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.ok !== true) {
+    throw new Error(payload.error || `TikTok backend returned HTTP ${response.status}.`);
+  }
+  return payload;
+}
+
+function formatTikTokResult(payload, originalUrl) {
+  const d = payload.data || {};
+  const stats = d.stats || {};
+  const video = d.video || {};
+  const author = d.author || {};
+  const media = payload.media || {};
+
+  const lines = [
+    '🎬 TIKTOK VIDEO DETAILS',
+    '',
+    `📝 Title: ${d.title || 'Not available'}`,
+    `👤 Creator: ${author.nickname || 'Unknown'}`,
+    `🔗 Username: ${author.username ? '@' + author.username : 'Not available'}`,
+    `🆔 Video ID: ${video.id || 'Not available'}`,
+    `🌍 Region: ${video.region || 'Not available'}`,
+    '',
+    '📊 STATISTICS',
+    `👁 Views: ${formatCount(stats.views)}`,
+    `❤️ Likes: ${formatCount(stats.likes)}`,
+    `💬 Comments: ${formatCount(stats.comments)}`,
+    `⭐ Favorites: ${formatCount(stats.favorites)}`,
+    `🔁 Shares: ${formatCount(stats.shares)}`,
+    `⬇️ Downloads: ${formatCount(stats.downloads)}`,
+    '',
+    '🎞 VIDEO INFORMATION',
+    `📐 API resolution: ${video.resolution || 'Not available'}`,
+    `⏱ Duration: ${video.duration != null ? formatDuration(video.duration) : 'Not available'}`,
+    `🎥 Definition: ${video.definition || 'Not available'}`,
+    `🧩 API codec: ${video.codec || 'Not available'}`,
+    `📦 API bitrate: ${video.bitrate || 'Not available'}`,
+  ];
+
+  if (media && Object.keys(media).length) {
+    lines.push(
+      '',
+      '🔬 FFPROBE (DOWNLOADED STREAM)',
+      `📐 Actual resolution: ${media.resolution || 'Not available'}`,
+      `🎞 FPS: ${media.fps ?? 'Not available'}`,
+      `🎥 Video codec: ${media.video_codec || media.codec || 'Not available'}`,
+      `🔊 Audio codec: ${media.audio_codec || 'Not available'}`,
+      `🎨 Pixel format: ${media.pixel_format || 'Not available'}`,
+      `📊 Bitrate: ${media.bitrate ? formatCount(media.bitrate) + ' bps' : 'Not available'}`,
+      `⏱ Duration: ${media.duration ? formatDuration(media.duration) : 'Not available'}`,
+      `📁 File size: ${media.file_size ? (media.file_size / 1048576).toFixed(2) + ' MB' : 'Not available'}`
+    );
+  }
+
+  const sound = d.sound || {};
+  if (sound.title || sound.artist) {
+    lines.push('', '🎵 SOUND', `${sound.title || 'Unknown'} — ${sound.artist || 'Unknown'}`);
+  }
+
+  if (Array.isArray(d.tags) && d.tags.length) {
+    lines.push('', `🏷 Tags: ${d.tags.slice(0, 12).join(', ')}`);
+  }
+
+  lines.push('', '🔗 Original URL:', originalUrl);
+  return lines.join('\n').slice(0, 3900);
+}
+
 bot.on('text', async (ctx) => {
   const text = (ctx.message.text || '').trim();
-
   if (!validTikTokUrl(text)) return;
 
-  const url =
-    `${MINI_APP_URL.replace(/\/?$/, '/')}?url=${encodeURIComponent(text)}`;
+  const status = await ctx.reply('🔎 TikTok link received.\nConnecting to the checker backend…');
+  try {
+    // Analyze also runs FFprobe against the downloaded rendition on the backend.
+    const result = await requestTikTokBackend('analyze', text);
+    const message = formatTikTokResult(result, text);
+    const d = result.data || {};
+    const downloads = d.downloads || {};
+    const buttons = [];
 
-  return ctx.reply(
-    '🔎 TikTok link received.\nTap below to open full details and downloads.',
-    Markup.inlineKeyboard([
-      [
-        Markup.button.webApp(
-          '🔎 Open Checker & Downloader',
-          url
-        )
-      ]
-    ])
-  );
+    if (downloads.video) buttons.push(Markup.button.url('⬇️ Download Video', downloads.video));
+    if (downloads.hd) buttons.push(Markup.button.url('💎 HD Video', downloads.hd));
+    if (downloads.audio) buttons.push(Markup.button.url('🎵 Audio', downloads.audio));
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      status.message_id,
+      undefined,
+      message,
+      buttons.length ? Markup.inlineKeyboard(buttons.map(b => [b])) : undefined
+    );
+  } catch (err) {
+    console.error('[tiktok-backend]', scrub(err && err.stack || err));
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      status.message_id,
+      undefined,
+      `❌ TikTok check failed.\n\n${scrub(err && err.message || 'Backend request failed.').slice(0, 1200)}`
+    ).catch(() => {});
+  }
 });
 
 // Error handling

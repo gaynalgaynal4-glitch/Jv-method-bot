@@ -6,7 +6,7 @@
 - **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
 - **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
 - **Alpha**: replaces the old FFmpeg menu option. It creates a 720p WMV2/WMAV2 output at 18 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
-- **Checker & Downloader**: TikWM metadata, region field where returned, standard/HD download links, original-quality task flow, and native FFprobe inspection of the downloaded stream.
+- **Checker & Downloader**: TikTok URLs are sent from the bot to the Netlify Node.js backend (`TIKTOK_API_URL`); the bot displays metadata and FFprobe results directly in Telegram with download buttons. It no longer opens the HTML Mini App.
 
 ## Deploy
 1. Use Node.js 20 or newer.
@@ -14,8 +14,9 @@
 3. Set `XORA_API_KEY` to your private API key.
 4. Set `RENDER_EXTERNAL_URL` (automatically provided by Render) or `PUBLIC_URL` to the public HTTPS service URL; Alpha exposes a short-lived, random input URL so the cloud processor can fetch the Telegram upload.
 5. Optional: set `ALPHA_VIDEO_BITRATE` (default `18M`, use `15M`–`20M`), `ALPHA_AUDIO_BITRATE` (default `128k`), `ALPHA_JOB_TIMEOUT_MS` (default 900000), `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, or `FFPROBE_PATH`.
-6. Run `npm install` then `npm start`.
-7. Set `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and a long random `ADMIN_TOKEN` in Render Environment. These are required for persistent maintenance controls.
+6. Set `TIKTOK_API_URL` to your Netlify function URL, for example `https://YOUR-SITE.netlify.app/.netlify/functions/tiktok`, and set `TIKTOK_API_SECRET` to the same value as the backend's `API_SECRET`.
+7. Run `npm install` then `npm start`.
+8. Set `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and a long random `ADMIN_TOKEN` in Render Environment. These are required for persistent maintenance controls.
 8. Deploy as a Render Web Service, not a static site.
 
 ## Maintenance dashboard
