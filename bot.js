@@ -2074,164 +2074,290 @@ async function requestTikTokBackend(action, url, extra = {}) {
   return payload;
 }
 
-function escapeHtml(value) {
-  return String(value == null ? '' : value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-function formatBitrate(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return 'Not available';
-  if (n >= 1000000) return `${(n / 1000000).toFixed(2)} Mbps`;
-  if (n >= 1000) return `${(n / 1000).toFixed(0)} kbps`;
-  return `${Math.round(n)} bps`;
-}
-
 function formatTikTokResult(payload, originalUrl) {
   const d = payload.data || {};
   const stats = d.stats || {};
   const video = d.video || {};
   const author = d.author || {};
   const media = payload.media || {};
-  const unavailable = 'Not available';
-  const resolution = media.resolution || (media.width && media.height ? `${media.width} × ${media.height}` : unavailable);
-  const duration = media.duration ? formatDuration(media.duration) : unavailable;
-  const fps = media.fps != null ? `${media.fps} FPS` : unavailable;
-  const codec = media.video_codec || media.codec || unavailable;
-  const fileSize = media.file_size ? `${(media.file_size / 1048576).toFixed(2)} MB` : unavailable;
-  const bitrate = formatBitrate(media.bitrate);
 
   const lines = [
-    '<b>🎬 TIKTOK VIDEO DETAILS</b>',
+    '🎬 TIKTOK VIDEO DETAILS',
     '',
-    `📝 <b>Title:</b> ${escapeHtml(d.title || unavailable)}`,
-    `👤 <b>Creator:</b> ${escapeHtml(author.nickname || 'Unknown')}`,
-    `🔗 <b>Username:</b> ${escapeHtml(author.username ? '@' + author.username : unavailable)}`,
-    `🆔 <b>Video ID:</b> ${escapeHtml(video.id || unavailable)}`,
-    `🌍 <b>Region:</b> ${escapeHtml(video.region || unavailable)}`,
+    `📝 Title: ${d.title || 'Not available'}`,
+    `👤 Creator: ${author.nickname || 'Unknown'}`,
+    `🔗 Username: ${author.username ? '@' + author.username : 'Not available'}`,
+    `🆔 Video ID: ${video.id || 'Not available'}`,
+    `🌍 Region: ${video.region || 'Not available'}`,
     '',
-    '<b>📊 STATISTICS</b>',
-    `👁 Views: ${escapeHtml(formatCount(stats.views))}`,
-    `❤️ Likes: ${escapeHtml(formatCount(stats.likes))}`,
-    `💬 Comments: ${escapeHtml(formatCount(stats.comments))}`,
-    `⭐ Favorites: ${escapeHtml(formatCount(stats.favorites))}`,
-    `🔁 Shares: ${escapeHtml(formatCount(stats.shares))}`,
-    `⬇️ Downloads: ${escapeHtml(formatCount(stats.downloads))}`,
+    '📊 STATISTICS',
+    `👁 Views: ${formatCount(stats.views)}`,
+    `❤️ Likes: ${formatCount(stats.likes)}`,
+    `💬 Comments: ${formatCount(stats.comments)}`,
+    `⭐ Favorites: ${formatCount(stats.favorites)}`,
+    `🔁 Shares: ${formatCount(stats.shares)}`,
+    `⬇️ Downloads: ${formatCount(stats.downloads)}`,
     '',
-    '<b>🎞 VIDEO INFORMATION</b>',
-    `<blockquote><b>📐 Resolution:</b> <i>${escapeHtml(resolution)}</i>\n<b>⏱ Duration:</b> <i>${escapeHtml(duration)}</i>\n<b>🎞 Frame rate:</b> <i>${escapeHtml(fps)}</i>\n<b>🎥 Codec:</b> <i>${escapeHtml(codec)}</i>\n<b>📦 File size:</b> <i>${escapeHtml(fileSize)}</i>\n<b>📊 Bitrate:</b> <i>${escapeHtml(bitrate)}</i></blockquote>`,
+    '🎞 VIDEO INFORMATION',
+    `📐 API resolution: ${video.resolution || 'Not available'}`,
+    `⏱ Duration: ${video.duration != null ? formatDuration(video.duration) : 'Not available'}`,
+    `🎥 Definition: ${video.definition || 'Not available'}`,
+    `🧩 API codec: ${video.codec || 'Not available'}`,
+    `📦 API bitrate: ${video.bitrate || 'Not available'}`,
   ];
+
+  if (media && Object.keys(media).length) {
+    lines.push(
+      '',
+      '🔬 FFPROBE (DOWNLOADED STREAM)',
+      `📐 Actual resolution: ${media.resolution || 'Not available'}`,
+      `🎞 FPS: ${media.fps ?? 'Not available'}`,
+      `🎥 Video codec: ${media.video_codec || media.codec || 'Not available'}`,
+      `🔊 Audio codec: ${media.audio_codec || 'Not available'}`,
+      `🎨 Pixel format: ${media.pixel_format || 'Not available'}`,
+      `📊 Bitrate: ${media.bitrate ? formatCount(media.bitrate) + ' bps' : 'Not available'}`,
+      `⏱ Duration: ${media.duration ? formatDuration(media.duration) : 'Not available'}`,
+      `📁 File size: ${media.file_size ? (media.file_size / 1048576).toFixed(2) + ' MB' : 'Not available'}`
+    );
+  }
 
   const sound = d.sound || {};
   if (sound.title || sound.artist) {
-    lines.push('', `🎵 <b>SOUND</b>`, `${escapeHtml(sound.title || 'Unknown')} — ${escapeHtml(sound.artist || 'Unknown')}`);
+    lines.push('', '🎵 SOUND', `${sound.title || 'Unknown'} — ${sound.artist || 'Unknown'}`);
   }
 
   if (Array.isArray(d.tags) && d.tags.length) {
-    lines.push('', `🏷 <b>Tags:</b> ${escapeHtml(d.tags.slice(0, 12).join(', '))}`);
+    lines.push('', `🏷 Tags: ${d.tags.slice(0, 12).join(', ')}`);
   }
 
-  lines.push('', `🔗 <b>Original URL:</b>`, escapeHtml(originalUrl));
+  lines.push('', '🔗 Original URL:', originalUrl);
   return lines.join('\n').slice(0, 3900);
 }
 
-// TikTok interaction state is short-lived and held in memory. Each callback is bound
-// to the Telegram user and chat that submitted the URL.
-const tiktokRequests = new Map();
-function rememberTikTokRequest(userId, chatId, url) {
-  const token = crypto.randomBytes(6).toString('hex');
-  tiktokRequests.set(token, { userId, chatId, url, createdAt: Date.now() });
-  for (const [key, value] of tiktokRequests) {
-    if (Date.now() - value.createdAt > 30 * 60 * 1000) tiktokRequests.delete(key);
-  }
-  while (tiktokRequests.size > 500) tiktokRequests.delete(tiktokRequests.keys().next().value);
-  return token;
-}
-function getTikTokRequest(ctx, token) {
-  const item = tiktokRequests.get(token);
-  if (!item || item.userId !== ctx.from.id || String(item.chatId) !== String(ctx.chat.id)) {
-    throw new Error('This TikTok button has expired. Send the link again.');
-  }
-  return item;
+// ---- TikTok card (stateless: nothing is stored, every button carries the video id) -------
+const escHtml = (v) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function regionName(code) {
+  if (!code) return '';
+  try { return new Intl.DisplayNames(['en'], { type: 'region' }).of(String(code).toUpperCase()) || String(code); }
+  catch (_) { return String(code); }
 }
 
-bot.action(/^tt:check:([a-f0-9]+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Checking video details…').catch(() => {});
-  try {
-    const item = getTikTokRequest(ctx, ctx.match[1]);
-    await ctx.editMessageText('🔎 Checking video details and inspecting the available rendition…').catch(() => {});
-    const result = await requestTikTokBackend('analyze', item.url);
-    await ctx.reply(formatTikTokResult(result, item.url), { parse_mode: 'HTML' });
-  } catch (err) {
-    await ctx.reply(`❌ Check failed: ${scrub(err.message || err).slice(0, 900)}`);
+function postedDate(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return new Date(n * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+}
+
+function mbText(bytes) {
+  const n = Number(bytes);
+  return Number.isFinite(n) && n > 0 ? `${(n / 1048576).toFixed(1)}MB` : '';
+}
+
+function qualityLabel({ width, height, fps, size }) {
+  const parts = [];
+  const side = Math.min(Number(width) || 0, Number(height) || 0);
+  if (side) parts.push(`${side}p`);
+  if (Number.isFinite(fps) && fps > 0) parts.push(`${Math.round(fps)}fps`);
+  const mb = mbText(size);
+  if (mb) parts.push(mb);
+  return parts.length ? `⬇️ ${parts.join(' • ')}` : null;
+}
+
+// Reads resolution + fps straight from the remote file with FFprobe (only the header is fetched, ~1-3 s)
+// and the size from Content-Length, so the button can say "576p • 30fps • 6.1MB" right away.
+async function probeStandardQuality(url, timeoutMs = 10000) {
+  if (!url) return null;
+  const args = ['-v', 'error', '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'];
+  try { if (/(^|\.)tikwm\.com$/i.test(new URL(url).hostname)) args.push('-headers', 'Referer: https://www.tikwm.com/\r\n'); } catch (_) {}
+  args.push('-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,r_frame_rate', '-show_entries', 'format=size', '-of', 'json', url);
+
+  const probe = await new Promise((resolve, reject) => {
+    execFile(FFPROBE, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+    });
+  });
+
+  const st = (probe.streams || [])[0] || {};
+  let size = Number(probe.format && probe.format.size) || 0;
+  if (!size) {
+    try {
+      const head = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(6000) });
+      size = Number(head.headers.get('content-length')) || 0;
+    } catch (_) {}
   }
-});
+  let fps = parseFps(st.avg_frame_rate);
+  if (!Number.isFinite(fps) || fps <= 0) fps = parseFps(st.r_frame_rate);
+  return qualityLabel({ width: st.width, height: st.height, fps, size });
+}
 
-bot.action(/^tt:original:([a-f0-9]+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Preparing the original-quality video…').catch(() => {});
-  let outputPath;
-  try {
-    const item = getTikTokRequest(ctx, ctx.match[1]);
-    const statusMessage = await ctx.reply('⏳ Requesting the best available original-quality video…');
-    const submitted = await requestTikTokBackend('original_submit', item.url);
-    if (!submitted.task_id) throw new Error('Original download task was not created.');
+function tiktokCaption(d) {
+  const a = d.author || {}, v = d.video || {};
+  const head = [
+    `👤 <b>${escHtml(a.nickname || a.username || 'Unknown')}</b>`,
+    postedDate(v.posted_at) && `📅 ${postedDate(v.posted_at)}`
+  ].filter(Boolean).join('  ·  ');
+  const region = regionName(v.region);
+  let desc = String(d.title || '').trim();
+  if (desc.length > 600) desc = desc.slice(0, 597) + '…';
+  const quote = [head, region && `📍 ${escHtml(region)}`, desc && escHtml(desc)].filter(Boolean).join('\n');
+  return `<blockquote expandable>${quote}</blockquote>\n↓ Choose an action`;
+}
 
-    let fileUrl = null;
-    let lastStatus = 'processing';
-    for (let attempt = 0; attempt < 25; attempt++) {
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const result = await requestTikTokBackend('original_status', item.url, { task_id: submitted.task_id });
-      fileUrl = result.original_download || null;
-      lastStatus = result.status || lastStatus;
-      if (fileUrl) break;
-      if (/failed|error/i.test(lastStatus)) throw new Error(`Original download provider status: ${lastStatus}`);
+// callback_data = "tt:<action>:<videoId>[:<username>]" (max 64 bytes) - the bot keeps no state at all.
+const TT_CALLBACK = /^tt:(std|mp3|original|check):(\d{5,25})(?::([\w.]{1,24}))?$/;
+function ttData(action, d) {
+  const id = String(d.video && d.video.id || '');
+  const user = String(d.author && d.author.username || '');
+  return `tt:${action}:${id}${/^[\w.]{1,24}$/.test(user) ? ':' + user : ''}`;
+}
+function ttUrl(id, user) {
+  return `https://www.tiktok.com/@${user || '_'}/video/${id}`;
+}
+
+function tiktokKeyboard(d, label) {
+  const size = mbText(d.video && d.video.size);
+  const rows = [
+    [Markup.button.callback(label || `⬇️ Standard download${size ? ' • ' + size : ''}`, ttData('std', d))],
+    [
+      Markup.button.callback('⚡ Original', ttData('original', d)),
+      Markup.button.callback('🎵 MP3', ttData('mp3', d)),
+      Markup.button.callback('📊 Check', ttData('check', d))
+    ]
+  ];
+  const user = d.author && d.author.username;
+  if (user) rows.push([Markup.button.url(`🎵 ${d.author.nickname || user}`, `https://www.tiktok.com/@${encodeURIComponent(user)}`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function sendTikTokPreview(ctx, d, label) {
+  const caption = tiktokCaption(d);
+  const keyboard = tiktokKeyboard(d, label);
+  const photoExtra = { caption, parse_mode: 'HTML', has_spoiler: true, ...keyboard };
+  const cover = d.cover;
+
+  if (cover) {
+    try {
+      return await ctx.telegram.sendPhoto(ctx.chat.id, cover, photoExtra);
+    } catch (_) {
+      // Telegram could not fetch the cover URL itself: download it here and upload the bytes.
+      try {
+        const r = await fetch(cover, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(15000) });
+        if (!r.ok) throw new Error('cover');
+        return await ctx.telegram.sendPhoto(ctx.chat.id, { source: Buffer.from(await r.arrayBuffer()) }, photoExtra);
+      } catch (_) {}
     }
-    if (!fileUrl) throw new Error('TikTok provider did not return the original video link in time. Please try again.');
+  }
 
-    outputPath = tempPath(ctx.from.id, 'tiktok_original', '.mp4');
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '⬇️ Downloading the original-quality video…').catch(() => {});
+  return ctx.telegram.sendMessage(ctx.chat.id, caption, { parse_mode: 'HTML', ...keyboard });
+}
+
+async function tiktokDeliver(ctx, d, { title, kind, caption, getUrl }) {
+  const status = await ctx.reply(`⏳ ${title}…`);
+  const setStatus = (text) => ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, text).catch(() => {});
+  let outputPath;
+
+  try {
+    const fileUrl = await getUrl(setStatus);
+    if (!fileUrl) throw new Error('No download link is available for this video.');
+    outputPath = tempPath(ctx.from.id, 'tiktok', kind === 'audio' ? '.mp3' : '.mp4');
+    await setStatus('⬇️ Downloading…');
     await downloadToFile(fileUrl, outputPath, MAX_UPLOAD_BYTES);
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '📤 Sending the video directly to Telegram…').catch(() => {});
-    await sendVideoFile(ctx, outputPath, '✅ Original / best available TikTok quality');
-    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '✅ Original video sent.').catch(() => {});
+    await setStatus('📤 Sending…');
+
+    if (kind === 'audio') {
+      const sound = d.sound || {};
+      await ctx.replyWithAudio({ source: outputPath }, { title: sound.title || 'TikTok sound', performer: sound.artist || undefined, caption });
+    } else {
+      await sendVideoFile(ctx, outputPath, caption);
+    }
+
+    await ctx.telegram.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
   } catch (err) {
-    await ctx.reply(`❌ Original download failed: ${scrub(err.message || err).slice(0, 1000)}`);
+    await setStatus(`❌ ${title} failed\n${scrub(err && err.message || err).slice(0, 900)}\n\nSend the link again to retry.`);
   } finally {
     if (outputPath) await fs.promises.unlink(outputPath).catch(() => {});
+  }
+}
+
+// Every card button: the card disappears at once (Telegram's own delete animation), then the action runs.
+function ttAction(action, work) {
+  bot.action(new RegExp(`^tt:${action}:\\d{5,25}(?::[\\w.]{1,24})?$`), async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const [, , id, user] = TT_CALLBACK.exec(ctx.callbackQuery.data) || [];
+    if (!id) return;
+
+    withBusy(ctx, async () => {
+      await ctx.deleteMessage().catch(() => {});
+      const url = ttUrl(id, user);
+      let d;
+      try {
+        d = (await requestTikTokBackend('check', url)).data || {};
+      } catch (err) {
+        return ctx.reply(`❌ Could not load the video.\n${scrub(err && err.message || err).slice(0, 700)}\n\nSend the link again to retry.`);
+      }
+      return work(ctx, d, url);
+    });
+  });
+}
+
+ttAction('std', (ctx, d) => tiktokDeliver(ctx, d, {
+  title: 'Standard download', kind: 'video', caption: '✅ Standard quality',
+  getUrl: async () => d.downloads && (d.downloads.video || d.downloads.hd)
+}));
+
+ttAction('mp3', (ctx, d) => tiktokDeliver(ctx, d, {
+  title: 'MP3 download', kind: 'audio', caption: '🎵 TikTok audio',
+  getUrl: async () => (d.downloads && d.downloads.audio) || (d.sound && d.sound.url)
+}));
+
+ttAction('original', (ctx, d, url) => tiktokDeliver(ctx, d, {
+  title: 'Original download', kind: 'video', caption: '✅ Original / best available TikTok quality',
+  getUrl: async (setStatus) => {
+    const submitted = await requestTikTokBackend('original_submit', url);
+    if (!submitted.task_id) throw new Error('Original download task was not created.');
+    await setStatus('⏳ Preparing the original-quality video…');
+    let lastStatus = 'processing';
+    for (let attempt = 0; attempt < 25; attempt++) {
+      await sleep(2000);
+      const result = await requestTikTokBackend('original_status', url, { task_id: submitted.task_id });
+      lastStatus = result.status || lastStatus;
+      if (result.original_download) return result.original_download;
+      if (/failed|error/i.test(String(lastStatus))) throw new Error(`Original download provider status: ${lastStatus}`);
+    }
+    throw new Error('TikTok provider did not return the original video link in time. Please try again.');
+  }
+}));
+
+ttAction('check', async (ctx, d, url) => {
+  const status = await ctx.reply('🔎 Checking video details…');
+  try {
+    const result = await requestTikTokBackend('analyze', url, { quality: 'standard' });
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, formatTikTokResult(result, url));
+  } catch (err) {
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Check failed\n${scrub(err && err.message || err).slice(0, 900)}`).catch(() => {});
   }
 });
 
 bot.on('text', async (ctx) => {
-  const text = (ctx.message.text || '').trim();
-  if (!validTikTokUrl(text)) return;
+  const found = (ctx.message.text || '').match(/https?:\/\/[^\s]+/);
+  const link = found && found[0];
+  if (!link || !validTikTokUrl(link)) return;
 
-  const status = await ctx.reply('🔎 TikTok link received.\nRetrieving video information…');
+  const status = await ctx.reply('🔎 Fetching video…');
   try {
-    // Fetch metadata and inspect the available video stream immediately.
-    const result = await requestTikTokBackend('analyze', text);
-    const message = formatTikTokResult(result, text);
-    const token = rememberTikTokRequest(ctx.from.id, ctx.chat.id, text);
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      undefined,
-      message,
-      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
-        [Markup.button.callback('⬇️ Original Download', `tt:original:${token}`)],
-        [Markup.button.callback('🔎 Check', `tt:check:${token}`)],
-      ]) }
-    );
+    const d = (await requestTikTokBackend('check', link)).data || {};
+    if (!d.video || !d.video.id) throw new Error('Could not read the video ID from this link.');
+    let label = null;
+    try { label = await probeStandardQuality(d.downloads && (d.downloads.video || d.downloads.hd)); }
+    catch (err) { console.warn('[tiktok] Local quality probe failed:', scrub(err && err.message || err)); }
+    await sendTikTokPreview(ctx, d, label);
+    await ctx.telegram.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
   } catch (err) {
     console.error('[tiktok-backend]', scrub(err && err.stack || err));
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      undefined,
-      `❌ TikTok check failed.\n\n${scrub(err && err.message || 'Backend request failed.').slice(0, 1200)}`
-    ).catch(() => {});
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined,
+      `❌ TikTok check failed.\n\n${scrub(err && err.message || 'Backend request failed.').slice(0, 1200)}`).catch(() => {});
   }
 });
 
