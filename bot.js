@@ -2052,7 +2052,7 @@ function formatDuration(value) {
   return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
 }
 
-async function requestTikTokBackend(action, url) {
+async function requestTikTokBackend(action, url, extra = {}) {
   if (!TIKTOK_API_URL) {
     throw new Error('TikTok backend is not configured. Set TIKTOK_API_URL in the bot environment.');
   }
@@ -2063,7 +2063,7 @@ async function requestTikTokBackend(action, url) {
   const response = await fetch(TIKTOK_API_URL, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ action, url }),
+    body: JSON.stringify({ action, url, ...extra }),
     signal: AbortSignal.timeout(55000)
   });
 
@@ -2134,29 +2134,91 @@ function formatTikTokResult(payload, originalUrl) {
   return lines.join('\n').slice(0, 3900);
 }
 
+// TikTok interaction state is short-lived and held in memory. Each callback is bound
+// to the Telegram user and chat that submitted the URL.
+const tiktokRequests = new Map();
+function rememberTikTokRequest(userId, chatId, url) {
+  const token = crypto.randomBytes(6).toString('hex');
+  tiktokRequests.set(token, { userId, chatId, url, createdAt: Date.now() });
+  for (const [key, value] of tiktokRequests) {
+    if (Date.now() - value.createdAt > 30 * 60 * 1000) tiktokRequests.delete(key);
+  }
+  while (tiktokRequests.size > 500) tiktokRequests.delete(tiktokRequests.keys().next().value);
+  return token;
+}
+function getTikTokRequest(ctx, token) {
+  const item = tiktokRequests.get(token);
+  if (!item || item.userId !== ctx.from.id || String(item.chatId) !== String(ctx.chat.id)) {
+    throw new Error('This TikTok button has expired. Send the link again.');
+  }
+  return item;
+}
+
+bot.action(/^tt:check:([a-f0-9]+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Checking video details…').catch(() => {});
+  try {
+    const item = getTikTokRequest(ctx, ctx.match[1]);
+    await ctx.editMessageText('🔎 Checking video details and inspecting the available rendition…').catch(() => {});
+    const result = await requestTikTokBackend('analyze', item.url);
+    await ctx.reply(formatTikTokResult(result, item.url));
+  } catch (err) {
+    await ctx.reply(`❌ Check failed: ${scrub(err.message || err).slice(0, 900)}`);
+  }
+});
+
+bot.action(/^tt:original:([a-f0-9]+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Preparing the original-quality video…').catch(() => {});
+  let outputPath;
+  try {
+    const item = getTikTokRequest(ctx, ctx.match[1]);
+    const statusMessage = await ctx.reply('⏳ Requesting the best available original-quality video…');
+    const submitted = await requestTikTokBackend('original_submit', item.url);
+    if (!submitted.task_id) throw new Error('Original download task was not created.');
+
+    let fileUrl = null;
+    let lastStatus = 'processing';
+    for (let attempt = 0; attempt < 25; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const result = await requestTikTokBackend('original_status', item.url, { task_id: submitted.task_id });
+      fileUrl = result.original_download || null;
+      lastStatus = result.status || lastStatus;
+      if (fileUrl) break;
+      if (/failed|error/i.test(lastStatus)) throw new Error(`Original download provider status: ${lastStatus}`);
+    }
+    if (!fileUrl) throw new Error('TikTok provider did not return the original video link in time. Please try again.');
+
+    outputPath = tempPath(ctx.from.id, 'tiktok_original', '.mp4');
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '⬇️ Downloading the original-quality video…').catch(() => {});
+    await downloadToFile(fileUrl, outputPath, MAX_UPLOAD_BYTES);
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '📤 Sending the video directly to Telegram…').catch(() => {});
+    await sendVideoFile(ctx, outputPath, '✅ Original / best available TikTok quality');
+    await ctx.telegram.editMessageText(ctx.chat.id, statusMessage.message_id, undefined, '✅ Original video sent.').catch(() => {});
+  } catch (err) {
+    await ctx.reply(`❌ Original download failed: ${scrub(err.message || err).slice(0, 1000)}`);
+  } finally {
+    if (outputPath) await fs.promises.unlink(outputPath).catch(() => {});
+  }
+});
+
 bot.on('text', async (ctx) => {
   const text = (ctx.message.text || '').trim();
   if (!validTikTokUrl(text)) return;
 
-  const status = await ctx.reply('🔎 TikTok link received.\nConnecting to the checker backend…');
+  const status = await ctx.reply('🔎 TikTok link received.\nRetrieving video information…');
   try {
-    // Analyze also runs FFprobe against the downloaded rendition on the backend.
-    const result = await requestTikTokBackend('analyze', text);
+    // Initial response is metadata-only. FFprobe runs only when the user taps Check.
+    const result = await requestTikTokBackend('check', text);
     const message = formatTikTokResult(result, text);
-    const d = result.data || {};
-    const downloads = d.downloads || {};
-    const buttons = [];
-
-    if (downloads.video) buttons.push(Markup.button.url('⬇️ Download Video', downloads.video));
-    if (downloads.hd) buttons.push(Markup.button.url('💎 HD Video', downloads.hd));
-    if (downloads.audio) buttons.push(Markup.button.url('🎵 Audio', downloads.audio));
-
+    const token = rememberTikTokRequest(ctx.from.id, ctx.chat.id, text);
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       status.message_id,
       undefined,
       message,
-      buttons.length ? Markup.inlineKeyboard(buttons.map(b => [b])) : undefined
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⬇️ Original Download', `tt:original:${token}`)],
+        [Markup.button.callback('🔍 Check Details (FFprobe)', `tt:check:${token}`)],
+      ])
     );
   } catch (err) {
     console.error('[tiktok-backend]', scrub(err && err.stack || err));

@@ -6,7 +6,7 @@
 - **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
 - **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
 - **Alpha**: replaces the old FFmpeg menu option. It creates a 720p WMV2/WMAV2 output at 18 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
-- **Checker & Downloader**: TikTok URLs are sent from the bot to the Netlify Node.js backend (`TIKTOK_API_URL`); the bot displays metadata and FFprobe results directly in Telegram with download buttons. It no longer opens the HTML Mini App.
+- **Checker & Downloader**: TikTok URLs are sent to the Netlify backend. The bot shows metadata, provides an Original Download button that submits/polls the existing TikWM original task and sends the resulting MP4 directly into Telegram, and runs FFprobe only when Check Details is tapped. Browser Playback quality buttons are not enabled until the Kuronai Browser Playback resolver source/API is supplied; the TikWM HTML explicitly does not expose those browser streams.
 
 ## Deploy
 1. Use Node.js 20 or newer.
@@ -45,6 +45,6 @@
 - Jarvis ON sends `encode_video=true`; OFF sends `encode_video=false` to `/upload/`.
 - The extension's `/uploaden/` route is used for Enhanced and does not send `encode_video`.
 - Actual server encoding percentages are displayed only when the server emits a numeric `percent` in its NDJSON `progress` events. The elapsed timer continues independently.
-- The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html`; its API workflow is adapted to Telegram messages/buttons. The supplied TikWM HTML exposes `region`, creator/video metadata, standard links and an original-quality task API. It explicitly does not expose browser/phone playback quality. The country restriction reason is not provided by that API.
+- The original supplied HTML is retained in `assets/JV-Checker-Downloader-Full-Data.html`; its API workflow is adapted to Telegram messages/buttons. The supplied TikWM HTML exposes `region`, creator/video metadata, standard links and an original-quality task API. It does not expose Browser Playback stream variants. The country restriction reason is not provided by that API. The uploaded Kuronai project files in this deployment bundle contain the enhancement upload route reference, not the Browser Playback extraction implementation.
 - FFprobe inspects the downloaded rendition only; it cannot discover all private/server-side TikTok variants.
 - The original Luna method source is retained. The old FFmpeg method has been removed from the method menu and replaced by Alpha.
