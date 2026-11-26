@@ -2074,63 +2074,67 @@ async function requestTikTokBackend(action, url, extra = {}) {
   return payload;
 }
 
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function formatBitrate(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return 'Not available';
+  if (n >= 1000000) return `${(n / 1000000).toFixed(2)} Mbps`;
+  if (n >= 1000) return `${(n / 1000).toFixed(0)} kbps`;
+  return `${Math.round(n)} bps`;
+}
+
 function formatTikTokResult(payload, originalUrl) {
   const d = payload.data || {};
   const stats = d.stats || {};
   const video = d.video || {};
   const author = d.author || {};
   const media = payload.media || {};
+  const unavailable = 'Not available';
+  const resolution = media.resolution || (media.width && media.height ? `${media.width} × ${media.height}` : unavailable);
+  const duration = media.duration ? formatDuration(media.duration) : unavailable;
+  const fps = media.fps != null ? `${media.fps} FPS` : unavailable;
+  const codec = media.video_codec || media.codec || unavailable;
+  const fileSize = media.file_size ? `${(media.file_size / 1048576).toFixed(2)} MB` : unavailable;
+  const bitrate = formatBitrate(media.bitrate);
 
   const lines = [
-    '🎬 TIKTOK VIDEO DETAILS',
+    '<b>🎬 TIKTOK VIDEO DETAILS</b>',
     '',
-    `📝 Title: ${d.title || 'Not available'}`,
-    `👤 Creator: ${author.nickname || 'Unknown'}`,
-    `🔗 Username: ${author.username ? '@' + author.username : 'Not available'}`,
-    `🆔 Video ID: ${video.id || 'Not available'}`,
-    `🌍 Region: ${video.region || 'Not available'}`,
+    `📝 <b>Title:</b> ${escapeHtml(d.title || unavailable)}`,
+    `👤 <b>Creator:</b> ${escapeHtml(author.nickname || 'Unknown')}`,
+    `🔗 <b>Username:</b> ${escapeHtml(author.username ? '@' + author.username : unavailable)}`,
+    `🆔 <b>Video ID:</b> ${escapeHtml(video.id || unavailable)}`,
+    `🌍 <b>Region:</b> ${escapeHtml(video.region || unavailable)}`,
     '',
-    '📊 STATISTICS',
-    `👁 Views: ${formatCount(stats.views)}`,
-    `❤️ Likes: ${formatCount(stats.likes)}`,
-    `💬 Comments: ${formatCount(stats.comments)}`,
-    `⭐ Favorites: ${formatCount(stats.favorites)}`,
-    `🔁 Shares: ${formatCount(stats.shares)}`,
-    `⬇️ Downloads: ${formatCount(stats.downloads)}`,
+    '<b>📊 STATISTICS</b>',
+    `👁 Views: ${escapeHtml(formatCount(stats.views))}`,
+    `❤️ Likes: ${escapeHtml(formatCount(stats.likes))}`,
+    `💬 Comments: ${escapeHtml(formatCount(stats.comments))}`,
+    `⭐ Favorites: ${escapeHtml(formatCount(stats.favorites))}`,
+    `🔁 Shares: ${escapeHtml(formatCount(stats.shares))}`,
+    `⬇️ Downloads: ${escapeHtml(formatCount(stats.downloads))}`,
     '',
-    '🎞 VIDEO INFORMATION',
-    `📐 API resolution: ${video.resolution || 'Not available'}`,
-    `⏱ Duration: ${video.duration != null ? formatDuration(video.duration) : 'Not available'}`,
-    `🎥 Definition: ${video.definition || 'Not available'}`,
-    `🧩 API codec: ${video.codec || 'Not available'}`,
-    `📦 API bitrate: ${video.bitrate || 'Not available'}`,
+    '<b>🎞 VIDEO INFORMATION</b>',
+    `<blockquote><b>📐 Resolution:</b> <i>${escapeHtml(resolution)}</i>\n<b>⏱ Duration:</b> <i>${escapeHtml(duration)}</i>\n<b>🎞 Frame rate:</b> <i>${escapeHtml(fps)}</i>\n<b>🎥 Codec:</b> <i>${escapeHtml(codec)}</i>\n<b>📦 File size:</b> <i>${escapeHtml(fileSize)}</i>\n<b>📊 Bitrate:</b> <i>${escapeHtml(bitrate)}</i></blockquote>`,
   ];
-
-  if (media && Object.keys(media).length) {
-    lines.push(
-      '',
-      '🔬 FFPROBE (DOWNLOADED STREAM)',
-      `📐 Actual resolution: ${media.resolution || 'Not available'}`,
-      `🎞 FPS: ${media.fps ?? 'Not available'}`,
-      `🎥 Video codec: ${media.video_codec || media.codec || 'Not available'}`,
-      `🔊 Audio codec: ${media.audio_codec || 'Not available'}`,
-      `🎨 Pixel format: ${media.pixel_format || 'Not available'}`,
-      `📊 Bitrate: ${media.bitrate ? formatCount(media.bitrate) + ' bps' : 'Not available'}`,
-      `⏱ Duration: ${media.duration ? formatDuration(media.duration) : 'Not available'}`,
-      `📁 File size: ${media.file_size ? (media.file_size / 1048576).toFixed(2) + ' MB' : 'Not available'}`
-    );
-  }
 
   const sound = d.sound || {};
   if (sound.title || sound.artist) {
-    lines.push('', '🎵 SOUND', `${sound.title || 'Unknown'} — ${sound.artist || 'Unknown'}`);
+    lines.push('', `🎵 <b>SOUND</b>`, `${escapeHtml(sound.title || 'Unknown')} — ${escapeHtml(sound.artist || 'Unknown')}`);
   }
 
   if (Array.isArray(d.tags) && d.tags.length) {
-    lines.push('', `🏷 Tags: ${d.tags.slice(0, 12).join(', ')}`);
+    lines.push('', `🏷 <b>Tags:</b> ${escapeHtml(d.tags.slice(0, 12).join(', '))}`);
   }
 
-  lines.push('', '🔗 Original URL:', originalUrl);
+  lines.push('', `🔗 <b>Original URL:</b>`, escapeHtml(originalUrl));
   return lines.join('\n').slice(0, 3900);
 }
 
@@ -2160,7 +2164,7 @@ bot.action(/^tt:check:([a-f0-9]+)$/, async (ctx) => {
     const item = getTikTokRequest(ctx, ctx.match[1]);
     await ctx.editMessageText('🔎 Checking video details and inspecting the available rendition…').catch(() => {});
     const result = await requestTikTokBackend('analyze', item.url);
-    await ctx.reply(formatTikTokResult(result, item.url));
+    await ctx.reply(formatTikTokResult(result, item.url), { parse_mode: 'HTML' });
   } catch (err) {
     await ctx.reply(`❌ Check failed: ${scrub(err.message || err).slice(0, 900)}`);
   }
@@ -2206,8 +2210,8 @@ bot.on('text', async (ctx) => {
 
   const status = await ctx.reply('🔎 TikTok link received.\nRetrieving video information…');
   try {
-    // Initial response is metadata-only. FFprobe runs only when the user taps Check.
-    const result = await requestTikTokBackend('check', text);
+    // Fetch metadata and inspect the available video stream immediately.
+    const result = await requestTikTokBackend('analyze', text);
     const message = formatTikTokResult(result, text);
     const token = rememberTikTokRequest(ctx.from.id, ctx.chat.id, text);
     await ctx.telegram.editMessageText(
@@ -2215,10 +2219,10 @@ bot.on('text', async (ctx) => {
       status.message_id,
       undefined,
       message,
-      Markup.inlineKeyboard([
+      { parse_mode: 'HTML', ...Markup.inlineKeyboard([
         [Markup.button.callback('⬇️ Original Download', `tt:original:${token}`)],
-        [Markup.button.callback('🔍 Check Details (FFprobe)', `tt:check:${token}`)],
-      ])
+        [Markup.button.callback('🔎 Check', `tt:check:${token}`)],
+      ]) }
     );
   } catch (err) {
     console.error('[tiktok-backend]', scrub(err && err.stack || err));
