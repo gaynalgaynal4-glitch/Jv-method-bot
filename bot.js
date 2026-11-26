@@ -1295,6 +1295,7 @@ async function createAlphaJob(
     height: 1080,
     videoBitrate: ALPHA_VIDEO_BITRATE,
     audioBitrate: ALPHA_AUDIO_BITRATE,
+    durationSec: Number(estimate.outputDuration.toFixed(3)),
   };
 
   if (targetFps) {
@@ -1340,22 +1341,44 @@ async function createAlphaJob(
 
     const queueState = response.headers.get('x-queue-status');
     const queuePos = Number(response.headers.get('x-queue-position') || 0);
-
-    // The server holds the connection open while waiting in its queue and
-    // while FFmpeg encodes. It reports no percentage, so show elapsed time.
-    ticker = setInterval(() => {
-      const secs = Math.round((Date.now() - started) / 1000);
-      const stage = queueState === 'wait'
-        ? `Queued / encoding (was position ${queuePos})`
-        : 'Encoding';
-      onProgress(`${stage} • ${secs}s`, null);
-    }, 4000);
-    ticker.unref?.();
+    const serverJobId = response.headers.get('x-encoding-job-id');
 
     onProgress(
-      queueState === 'wait' ? `Queued (position ${queuePos})` : 'Encoding',
+      queueState === 'wait' ? `Queued (position ${queuePos})` : 'Starting',
       null
     );
+
+    // Real encoding progress: the server publishes FFmpeg's out_time for this
+    // job; poll it and show the percentage it reports.
+    let lastPct = null;
+    let lastState = queueState === 'wait' ? 'queued' : 'starting';
+    let polling = false;
+
+    const pollProgress = async () => {
+      if (polling || !serverJobId) return;
+      polling = true;
+      try {
+        const r = await fetch(
+          `${ENCODING_API_URL}/v1/progress/${encodeURIComponent(serverJobId)}`,
+          { headers: ENCODING_API_KEY ? { Authorization: `Bearer ${ENCODING_API_KEY}` } : {}, signal: AbortSignal.timeout(8000) }
+        );
+        if (r.ok) {
+          const d = await r.json();
+          if (Number.isFinite(Number(d.percent))) lastPct = Math.round(Number(d.percent));
+          if (d.state) lastState = d.state;
+        }
+      } catch (_) { /* keep last known value */ }
+      polling = false;
+
+      const secs = Math.round((Date.now() - started) / 1000);
+      const label = lastState === 'queued' ? 'Waiting in queue'
+        : lastState === 'done' ? 'Finishing'
+        : 'Encoding';
+      onProgress(`${label} • ${secs}s`, lastState === 'queued' ? null : lastPct);
+    };
+
+    ticker = setInterval(pollProgress, 3000);
+    ticker.unref?.();
 
     if (!response.body) {
       throw new Error('Alpha server returned an empty response.');
