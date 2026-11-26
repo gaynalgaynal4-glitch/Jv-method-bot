@@ -306,9 +306,11 @@ const METHODS = {
   },
 };
 
-const XORA_API = 'https://api.xora.sh/v1';
-const XORA_API_KEY = process.env.XORA_API_KEY || '';
-const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '18M';
+const ENCODING_API_URL =
+  (process.env.ENCODING_API_URL || 'https://ffmpagserver.netlify.app').replace(/\/+$/, '');
+const ENCODING_API_KEY = process.env.ENCODING_API_KEY || '';
+const ALPHA_PRESET_ID = process.env.ALPHA_PRESET_ID || 'alpha-wmv-1080p';
+const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '25M';
 const ALPHA_AUDIO_BITRATE = process.env.ALPHA_AUDIO_BITRATE || '128k';
 const ALPHA_JOB_TIMEOUT_MS =
   Number(process.env.ALPHA_JOB_TIMEOUT_MS || 15 * 60 * 1000);
@@ -1243,7 +1245,7 @@ function alphaEstimate(meta, targetFps) {
   const videoBps =
     Number(String(ALPHA_VIDEO_BITRATE)
       .replace(/k$/i, '000')
-      .replace(/m$/i, '000000')) || 18000000;
+      .replace(/m$/i, '000000')) || 25000000;
 
   const audioBps =
     Number(String(ALPHA_AUDIO_BITRATE)
@@ -1262,47 +1264,9 @@ function alphaEstimate(meta, targetFps) {
   };
 }
 
-async function xoraRequest(route, options = {}) {
-  if (!XORA_API_KEY) {
-    throw new Error('Alpha is not configured yet. Please contact the bot administrator.');
-  }
-
-  const response = await fetch(
-    `${XORA_API}${route}`,
-    {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${XORA_API_KEY}`,
-        ...(options.headers || {})
-      },
-      signal: options.signal || AbortSignal.timeout(120000),
-    }
-  );
-
-  const raw = await response.text();
-  let data = {};
-
-  try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch (_) {
-    data = { message: raw.slice(0, 500) };
-  }
-
-  if (!response.ok) {
-    const detail =
-      data.error && (data.error.message || data.error.code) ||
-      data.message ||
-      data.detail ||
-      `HTTP ${response.status}`;
-
-    throw new Error(`Alpha request failed: ${detail}`);
-  }
-
-  return data;
-}
-
 async function createAlphaJob(
   inputPath,
+  outputPath,
   targetFps,
   estimate,
   onProgress
@@ -1323,141 +1287,113 @@ async function createAlphaJob(
   const inputUrl =
     `${PUBLIC_URL.replace(/\/$/, '')}/alpha-input/${token}`;
 
-  const outputName = `alpha_${Date.now()}.wmv`;
-  const args = [];
+  const payload = {
+    inputUrl,
+    presetId: ALPHA_PRESET_ID,
+    videoCodec: 'wmv2',
+    audioCodec: 'wmav2',
+    height: 1080,
+    videoBitrate: ALPHA_VIDEO_BITRATE,
+    audioBitrate: ALPHA_AUDIO_BITRATE,
+  };
 
   if (targetFps) {
-    args.push('-itsscale', estimate.scaleFactor.toFixed(10));
+    payload.itsScale = Number(estimate.scaleFactor.toFixed(10));
   }
 
-  args.push(
-    '-i', '{{input}}',
-    '-map', '0:v:0', '-map', '0:a?',
-    '-vf', 'scale=-2:720:flags=lanczos',
-    '-c:v', 'wmv2', '-b:v', ALPHA_VIDEO_BITRATE,
-    '-maxrate', '20M', '-bufsize', '36M',
-    '-c:a', 'wmav2', '-b:a', ALPHA_AUDIO_BITRATE,
-    '-f', 'asf', '{{output}}'
-  );
-
-  const created = await xoraRequest(
-    '/jobs',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        mode: 'ffmpeg',
-        input_files: {
-          in_1: inputUrl
-        },
-        output_files: {
-          out_1: outputName
-        },
-        ffmpeg: {
-          args: args.map((arg) =>
-            arg === '{{input}}'
-              ? '{{in_1}}'
-              : arg === '{{output}}'
-                ? '{{out_1}}'
-                : arg
-          )
-        },
-        idempotencyKey: `alpha-${crypto.randomUUID()}`,
-      }),
-    }
-  );
-
-  const jobId = created.id || created.jobId;
-
-  if (!jobId) {
-    throw new Error('Alpha did not return a job ID.');
-  }
+  const headers = { 'Content-Type': 'application/json' };
+  if (ENCODING_API_KEY) headers.Authorization = `Bearer ${ENCODING_API_KEY}`;
 
   const started = Date.now();
-  const terminal = new Set([
-    'completed',
-    'failed',
-    'rejected',
-    'cancelled'
-  ]);
+  let ticker;
 
-  let job;
+  try {
+    const response = await fetch(`${ENCODING_API_URL}/v1/encode`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(ALPHA_JOB_TIMEOUT_MS),
+    });
 
-  while (Date.now() - started < ALPHA_JOB_TIMEOUT_MS) {
-    await sleep(2500);
+    if (!response.ok) {
+      const raw = await response.text().catch(() => '');
+      let data = {};
+      try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
 
-    job = await xoraRequest(
-      `/jobs/${encodeURIComponent(jobId)}`,
-      { method: 'GET' }
-    );
+      if (response.status === 429) {
+        throw new Error('Alpha is busy right now (queue is full). Please try again in a minute.');
+      }
+      if (response.status === 401) {
+        throw new Error('Alpha server rejected the API key. Check ENCODING_API_KEY.');
+      }
 
-    const pct = Number(job.progress);
-    const state = String(job.state || 'processing');
+      let detail =
+        data.error || data.detail || data.message ||
+        raw.slice(0, 300) || `HTTP ${response.status}`;
+
+      if (Array.isArray(data.availablePresets)) {
+        detail += ` (server presets: ${data.availablePresets.join(', ')}; bot sent: ${ALPHA_PRESET_ID})`;
+      }
+
+      throw new Error(`Alpha request failed: ${detail}`);
+    }
+
+    const queueState = response.headers.get('x-queue-status');
+    const queuePos = Number(response.headers.get('x-queue-position') || 0);
+
+    // The server holds the connection open while waiting in its queue and
+    // while FFmpeg encodes. It reports no percentage, so show elapsed time.
+    ticker = setInterval(() => {
+      const secs = Math.round((Date.now() - started) / 1000);
+      const stage = queueState === 'wait'
+        ? `Queued / encoding (was position ${queuePos})`
+        : 'Encoding';
+      onProgress(`${stage} • ${secs}s`, null);
+    }, 4000);
+    ticker.unref?.();
 
     onProgress(
-      state,
-      Number.isFinite(pct)
-        ? Math.max(0, Math.min(100, Math.round(pct)))
-        : null
+      queueState === 'wait' ? `Queued (position ${queuePos})` : 'Encoding',
+      null
     );
 
-    if (terminal.has(state)) {
-      break;
+    if (!response.body) {
+      throw new Error('Alpha server returned an empty response.');
     }
-  }
 
-  if (!job || !terminal.has(job.state)) {
-    throw new Error(
-      'Alpha processing timed out. Your original video is still available; try again later.'
+    let received = 0;
+    const limiter = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+        if (received > MAX_UPLOAD_BYTES) {
+          return cb(new Error('Alpha output is larger than the allowed upload size.'));
+        }
+        cb(null, chunk);
+      }
+    });
+
+    await pipeline(
+      Readable.fromWeb(response.body),
+      limiter,
+      fs.createWriteStream(outputPath)
     );
-  }
 
-  alphaInputTokens.delete(token);
+    if (received < 1024) {
+      throw new Error('Alpha server returned an empty or invalid video.');
+    }
 
-  if (job.state !== 'completed') {
-    const detail =
-      job.error && (job.error.message || job.error.code) ||
-      job.message ||
-      job.state;
-
-    throw new Error(`Alpha processing ${job.state}: ${detail}`);
-  }
-
-  const firstOutput = Array.isArray(job.outputs)
-    ? job.outputs[0]
-    : (
-        job.outputs &&
-        (job.outputs.out_1 || Object.values(job.outputs)[0])
+    return { jobId: response.headers.get('x-encoding-job-id'), bytes: received };
+  } catch (err) {
+    if (err && err.name === 'TimeoutError') {
+      throw new Error(
+        'Alpha processing timed out. Your original video is still available; try again later.'
       );
-
-  const namedOutput = job.output_files &&
-    (job.output_files.out_1 || Object.values(job.output_files)[0]);
-
-  const outputUrl =
-    (job.output && (job.output.signedUrl || job.output.url)) ||
-    (firstOutput && (
-      firstOutput.signedUrl ||
-      firstOutput.url ||
-      firstOutput.downloadUrl
-    )) ||
-    (typeof firstOutput === 'string' ? firstOutput : null) ||
-    (namedOutput && (
-      namedOutput.signedUrl ||
-      namedOutput.url ||
-      namedOutput.storage_url
-    )) ||
-    (typeof namedOutput === 'string' ? namedOutput : null);
-
-  if (!outputUrl) {
-    throw new Error('Alpha completed but did not return an output download URL.');
+    }
+    throw err;
+  } finally {
+    if (ticker) clearInterval(ticker);
+    alphaInputTokens.delete(token);
   }
-
-  return {
-    outputUrl,
-    jobId
-  };
 }
 
 async function runAlpha(ctx, pending, targetFps) {
@@ -1476,12 +1412,19 @@ async function runAlpha(ctx, pending, targetFps) {
     await editProgress(
       ctx,
       status.message_id,
-      '⚡ Alpha\nUploading video…',
+      '⚡ Alpha\nSending to encoding server…',
       true
     );
 
-    const result = await createAlphaJob(
+    outputPath = tempPath(
+      ctx.from.id,
+      'alpha_result',
+      '.wmv'
+    );
+
+    await createAlphaJob(
       pending.inputPath,
+      outputPath,
       targetFps,
       estimate,
       (stage, percent) => {
@@ -1493,25 +1436,6 @@ async function runAlpha(ctx, pending, targetFps) {
       }
     );
 
-    outputPath = tempPath(
-      ctx.from.id,
-      'alpha_result',
-      '.wmv'
-    );
-
-    await editProgress(
-      ctx,
-      status.message_id,
-      '⚡ Alpha\nDownloading finished video…',
-      true
-    );
-
-    await downloadToFile(
-      result.outputUrl,
-      outputPath,
-      MAX_UPLOAD_BYTES
-    );
-
     await editProgress(
       ctx,
       status.message_id,
@@ -1520,7 +1444,7 @@ async function runAlpha(ctx, pending, targetFps) {
     );
 
     const caption =
-      `✅ Alpha completed\nOutput: 720p WMV\n${targetFps ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` : 'FPS patch: Off\n'}Estimated duration: ${fmtTime(estimate.outputDuration)}\nEstimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
+      `✅ Alpha completed\nOutput: 1080p WMV2\n${targetFps ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` : 'FPS patch: Off\n'}Estimated duration: ${fmtTime(estimate.outputDuration)}\nEstimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
 
     await sendDocumentFile(
       ctx,
@@ -1797,7 +1721,7 @@ bot.action('menu:alpha', async (ctx) => {
   const maintenance = await getMaintenance();
   if (maintenance.alpha) return ctx.editMessageText('🛠 Alpha is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
   return ctx.editMessageText(
-    'Alpha can give you up to 720p 60fps or 30fps, depending on your choice. TikTok can still compress your video later, so HD Method is recommended.',
+    'Alpha can give you up to 1080p 60fps or 30fps, depending on your choice. TikTok can still compress your video later, so HD Method is recommended.',
     alphaConfirmKeyboard()
   );
 });
