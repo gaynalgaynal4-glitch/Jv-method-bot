@@ -2074,64 +2074,68 @@ async function requestTikTokBackend(action, url, extra = {}) {
   return payload;
 }
 
-function formatTikTokResult(payload, originalUrl) {
+function flagEmoji(code) {
+  const c = String(code || '').toUpperCase();
+  return /^[A-Z]{2}$/.test(c) ? String.fromCodePoint(...[...c].map(ch => 127397 + ch.charCodeAt(0))) : '';
+}
+
+function postedDateTime(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return new Date(n * 1000)
+    .toLocaleString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'UTC' })
+    .replace(' at ', ', ');
+}
+
+// "Check" message: video analytics (HTML). Bold titles/values, italic labels, quotes for each block.
+function formatTikTokResult(payload) {
   const d = payload.data || {};
-  const stats = d.stats || {};
-  const video = d.video || {};
-  const author = d.author || {};
-  const media = payload.media || {};
+  const a = d.author || {}, v = d.video || {}, st = d.stats || {}, sound = d.sound || {}, m = payload.media || {};
+  const esc = escHtml;
+  const row = (icon, label, value) => `${icon} <b>${label}</b> | ${value}`;
+  const stat = (icon, value, label) => `${icon} <b>${formatCount(value)}</b> <i>${label}</i>`;
+  const quote = (lines, expandable = false) => `<blockquote${expandable ? ' expandable' : ''}>${lines.join('\n')}</blockquote>`;
+  const out = [];
 
-  const lines = [
-    '🎬 TIKTOK VIDEO DETAILS',
-    '',
-    `📝 Title: ${d.title || 'Not available'}`,
-    `👤 Creator: ${author.nickname || 'Unknown'}`,
-    `🔗 Username: ${author.username ? '@' + author.username : 'Not available'}`,
-    `🆔 Video ID: ${video.id || 'Not available'}`,
-    `🌍 Region: ${video.region || 'Not available'}`,
-    '',
-    '📊 STATISTICS',
-    `👁 Views: ${formatCount(stats.views)}`,
-    `❤️ Likes: ${formatCount(stats.likes)}`,
-    `💬 Comments: ${formatCount(stats.comments)}`,
-    `⭐ Favorites: ${formatCount(stats.favorites)}`,
-    `🔁 Shares: ${formatCount(stats.shares)}`,
-    `⬇️ Downloads: ${formatCount(stats.downloads)}`,
-    '',
-    '🎞 VIDEO INFORMATION',
-    `📐 API resolution: ${video.resolution || 'Not available'}`,
-    `⏱ Duration: ${video.duration != null ? formatDuration(video.duration) : 'Not available'}`,
-    `🎥 Definition: ${video.definition || 'Not available'}`,
-    `🧩 API codec: ${video.codec || 'Not available'}`,
-    `📦 API bitrate: ${video.bitrate || 'Not available'}`,
-  ];
+  out.push('🎬 <b>VIDEO • ANALYTICS</b>', '');
 
-  if (media && Object.keys(media).length) {
-    lines.push(
-      '',
-      '🔬 FFPROBE (DOWNLOADED STREAM)',
-      `📐 Actual resolution: ${media.resolution || 'Not available'}`,
-      `🎞 FPS: ${media.fps ?? 'Not available'}`,
-      `🎥 Video codec: ${media.video_codec || media.codec || 'Not available'}`,
-      `🔊 Audio codec: ${media.audio_codec || 'Not available'}`,
-      `🎨 Pixel format: ${media.pixel_format || 'Not available'}`,
-      `📊 Bitrate: ${media.bitrate ? formatCount(media.bitrate) + ' bps' : 'Not available'}`,
-      `⏱ Duration: ${media.duration ? formatDuration(media.duration) : 'Not available'}`,
-      `📁 File size: ${media.file_size ? (media.file_size / 1048576).toFixed(2) + ' MB' : 'Not available'}`
-    );
-  }
+  const date = postedDateTime(v.posted_at);
+  out.push(`👤 <b>${esc(a.nickname || a.username || 'Unknown')}</b>${date ? `  📅 <i>${date}</i>` : ''}`);
 
-  const sound = d.sound || {};
+  let desc = String(d.title || '').trim();
+  if (!desc && Array.isArray(d.tags) && d.tags.length) desc = d.tags.map(t => '#' + String(t).replace(/^#/, '')).join(' ');
+  if (desc.length > 700) desc = desc.slice(0, 697) + '…';
+  if (desc) out.push(quote([`<i>${esc(desc)}</i>`], true));
+
   if (sound.title || sound.artist) {
-    lines.push('', '🎵 SOUND', `${sound.title || 'Unknown'} — ${sound.artist || 'Unknown'}`);
+    const dur = sound.duration || v.duration;
+    out.push(`🎵 <b><i>${esc(sound.title || sound.artist)}</i></b>${dur ? ` • <b>${formatDuration(dur)}</b>` : ''}`);
   }
 
-  if (Array.isArray(d.tags) && d.tags.length) {
-    lines.push('', `🏷 Tags: ${d.tags.slice(0, 12).join(', ')}`);
-  }
+  out.push('', '📊 <b>Statistics</b>', quote([
+    stat('👁', st.views, 'Views'), stat('❤️', st.likes, 'Likes'), stat('💬', st.comments, 'Comments'),
+    stat('🔖', st.favorites, 'Favorites'), stat('↗️', st.shares, 'Shares'), stat('⬇️', st.downloads, 'Downloads')
+  ]));
 
-  lines.push('', '🔗 Original URL:', originalUrl);
-  return lines.join('\n').slice(0, 3900);
+  const info = [];
+  if (v.id) info.push(row('🆔', 'ID', `<code>${esc(v.id)}</code>`));
+  if (v.region) info.push(row('📍', 'Region', `${flagEmoji(v.region)} <i>${esc(regionName(v.region))}</i>`.trim()));
+  if (v.vq_score != null) info.push(row('✨', 'VQ Score', `<b>${esc(v.vq_score)}</b>`));
+  if (info.length) out.push('', 'ℹ️ <b>Information</b>', quote(info));
+
+  const details = [];
+  if (m.resolution) details.push(row('📐', 'Resolution', `<code>${esc(m.resolution)}</code>`));
+  if (m.fps != null) details.push(row('🎞', 'FPS', `<code>${esc(m.fps)}</code>`));
+  if (m.video_codec || m.codec) details.push(row('🎥', 'Video codec', `<i>${esc(m.video_codec || m.codec)}</i>`));
+  if (m.audio_codec) details.push(row('🔊', 'Audio codec', `<i>${esc(m.audio_codec)}</i>`));
+  if (m.pixel_format) details.push(row('🎨', 'Pixel format', `<i>${esc(m.pixel_format)}</i>`));
+  if (m.bitrate) details.push(row('📊', 'Bitrate', `<b>${(m.bitrate / 1e6).toFixed(1)} Mbps</b>`));
+  if (m.duration) details.push(row('⏱', 'Duration', `<b>${formatDuration(m.duration)}</b>`));
+  if (m.file_size) details.push(row('📁', 'File size', `<b>${(m.file_size / 1048576).toFixed(1)} MB</b>`));
+  if (details.length) out.push('', '🎞 <b>Video details</b>', quote(details, true));
+
+  out.push('', '⚡ <b><i>JV Methods</i></b>');
+  return out.join('\n').slice(0, 4000);
 }
 
 // ---- TikTok card (stateless: nothing is stored, every button carries the video id) -------
@@ -2196,13 +2200,14 @@ function tiktokCaption(d) {
   const a = d.author || {}, v = d.video || {};
   const head = [
     `👤 <b>${escHtml(a.nickname || a.username || 'Unknown')}</b>`,
-    postedDate(v.posted_at) && `📅 ${postedDate(v.posted_at)}`
+    postedDate(v.posted_at) && `📅 <i>${postedDate(v.posted_at)}</i>`
   ].filter(Boolean).join('  ·  ');
   const region = regionName(v.region);
+  const flag = flagEmoji(v.region);
   let desc = String(d.title || '').trim();
   if (desc.length > 600) desc = desc.slice(0, 597) + '…';
-  const quote = [head, region && `📍 ${escHtml(region)}`, desc && escHtml(desc)].filter(Boolean).join('\n');
-  return `<blockquote expandable>${quote}</blockquote>\n↓ Choose an action`;
+  const quote = [head, region && `📍 <b>${flag ? flag + ' ' : ''}${escHtml(region)}</b>`, desc && `<i>${escHtml(desc)}</i>`].filter(Boolean).join('\n');
+  return `<blockquote expandable>${quote}</blockquote>\n<b>↓ Choose an action</b>`;
 }
 
 // callback_data = "tt:<action>:<videoId>[:<username>]" (max 64 bytes) - the bot keeps no state at all.
@@ -2334,7 +2339,12 @@ ttAction('check', async (ctx, d, url) => {
   const status = await ctx.reply('🔎 Checking video details…');
   try {
     const result = await requestTikTokBackend('analyze', url, { quality: 'standard' });
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, formatTikTokResult(result, url));
+    // The standard video is attached as a link preview above the text (like a video card).
+    const previewUrl = d.downloads && (d.downloads.video || d.downloads.hd);
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, formatTikTokResult(result), {
+      parse_mode: 'HTML',
+      link_preview_options: previewUrl ? { url: previewUrl, show_above_text: true, prefer_large_media: true } : { is_disabled: true }
+    });
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Check failed\n${scrub(err && err.message || err).slice(0, 900)}`).catch(() => {});
   }
