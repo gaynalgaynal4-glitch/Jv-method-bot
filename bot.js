@@ -10,7 +10,7 @@ const { execFile } = require('child_process');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 const express = require('express');
-const { Telegraf, Markup } = require('telegraf');
+const { Telegraf, Markup, Telegram } = require('telegraf');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const PORT = Number(process.env.PORT || 3000);
@@ -306,10 +306,8 @@ const METHODS = {
   },
 };
 
-const ENCODING_API_URL =
-  (process.env.ENCODING_API_URL || 'https://ffmpagserver.netlify.app').replace(/\/+$/, '');
-const ENCODING_API_KEY = process.env.ENCODING_API_KEY || '';
-const ALPHA_PRESET_ID = process.env.ALPHA_PRESET_ID || 'alpha-wmv-1080p';
+const XORA_API = 'https://api.xora.sh/v1';
+const XORA_API_KEY = process.env.XORA_API_KEY || '';
 const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '25M';
 const ALPHA_AUDIO_BITRATE = process.env.ALPHA_AUDIO_BITRATE || '128k';
 const ALPHA_JOB_TIMEOUT_MS =
@@ -359,6 +357,99 @@ function fmtTime(ms) {
 
   return `${String(Math.floor(s / 3600)).padStart(2, '0')}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 }
+
+// ---------------------------------------------------------------------------
+// Chat actions ("typing…", "sending video…" in the chat header) and ghost status
+// messages. Instead of posting "processing…" messages into the chat, the bot
+// shows Telegram's native chat action in the profile header. Status messages
+// are "ghosts": edits to them are dropped, except errors and real content
+// (messages with a keyboard/preview), which are sent as normal new messages.
+// ---------------------------------------------------------------------------
+const GHOST_ID = 'ghost-status';
+const chatActionState = new Map();
+
+function holdChatAction(chatId, action = 'typing') {
+  let st = chatActionState.get(chatId);
+  if (!st) {
+    st = { stack: [], timer: null };
+    chatActionState.set(chatId, st);
+  }
+
+  const token = { action };
+  st.stack.push(token);
+
+  const send = () => {
+    const cur = st.stack[st.stack.length - 1];
+    if (cur) bot.telegram.sendChatAction(chatId, cur.action).catch(() => {});
+  };
+
+  send();
+
+  if (!st.timer) {
+    st.timer = setInterval(send, 4000);
+    st.timer.unref?.();
+  }
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(safety);
+
+    const i = st.stack.indexOf(token);
+    if (i >= 0) st.stack.splice(i, 1);
+
+    if (!st.stack.length) {
+      clearInterval(st.timer);
+      if (chatActionState.get(chatId) === st) chatActionState.delete(chatId);
+    } else {
+      send();
+    }
+  };
+
+  // Safety net so an indicator can never get stuck forever.
+  const safety = setTimeout(release, 30 * 60 * 1000);
+  safety.unref?.();
+
+  return release;
+}
+
+function holdCtxAction(ctx, action = 'typing') {
+  if (!ctx || !ctx.chat) return () => {};
+  ctx.__actionReleases = ctx.__actionReleases || [];
+  const release = holdChatAction(ctx.chat.id, action);
+  ctx.__actionReleases.push(release);
+  return release;
+}
+
+function releaseCtxActions(ctx) {
+  const list = (ctx && ctx.__actionReleases) || [];
+  ctx.__actionReleases = [];
+  for (const release of list) release();
+}
+
+// Replaces `ctx.reply('processing…')`: shows "typing…" instead of a message.
+async function statusReply(ctx, _text) {
+  holdCtxAction(ctx, 'typing');
+  return { message_id: GHOST_ID };
+}
+
+const _tgEditMessageText = Telegram.prototype.editMessageText;
+Telegram.prototype.editMessageText = function (chatId, messageId, inlineMessageId, text, extra) {
+  if (messageId === GHOST_ID) {
+    const isError = typeof text === 'string' && text.trim().startsWith('❌');
+    const hasExtra = extra && Object.keys(extra).length > 0;
+    if (isError || hasExtra) return this.sendMessage(chatId, text, extra);
+    return Promise.resolve(true);
+  }
+  return _tgEditMessageText.call(this, chatId, messageId, inlineMessageId, text, extra);
+};
+
+const _tgDeleteMessage = Telegram.prototype.deleteMessage;
+Telegram.prototype.deleteMessage = function (chatId, messageId) {
+  if (messageId === GHOST_ID) return Promise.resolve(true);
+  return _tgDeleteMessage.call(this, chatId, messageId);
+};
 
 async function editProgress(ctx, messageId, text, force = false) {
   const now = Date.now();
@@ -675,7 +766,7 @@ async function telegramUpload(
   throw lastError;
 }
 
-async function sendVideoFile(ctx, filePath, caption) {
+async function sendVideoFileImpl(ctx, filePath, caption) {
   const size = fs.statSync(filePath).size;
 
   if (!size) {
@@ -739,7 +830,7 @@ async function sendVideoFile(ctx, filePath, caption) {
   }
 }
 
-async function sendDocumentFile(ctx, filePath, caption) {
+async function sendDocumentFileImpl(ctx, filePath, caption) {
   const size = fs.statSync(filePath).size;
 
   if (!size) {
@@ -762,6 +853,26 @@ async function sendDocumentFile(ctx, filePath, caption) {
     }
   );
 }
+
+// Show "sending video…" / "sending file…" in the chat header while uploading.
+async function sendVideoFile(ctx, filePath, caption) {
+  const release = holdChatAction(ctx.chat.id, 'upload_video');
+  try {
+    return await sendVideoFileImpl(ctx, filePath, caption);
+  } finally {
+    release();
+  }
+}
+
+async function sendDocumentFile(ctx, filePath, caption) {
+  const release = holdChatAction(ctx.chat.id, 'upload_document');
+  try {
+    return await sendDocumentFileImpl(ctx, filePath, caption);
+  } finally {
+    release();
+  }
+}
+
 
 // ---- Kuronai error handling: every failure becomes one consistent message ----
 class KuronaiError extends Error {
@@ -994,7 +1105,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   const title = enhanced ? 'Enhanced Method' : 'Jarvis';
   const started = Date.now();
 
-  const status = await ctx.reply(
+  const status = await statusReply(ctx,
     `⚙️ ${title}\nPreparing upload…\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: waiting for server…\nElapsed: 00:00:00`
   );
 
@@ -1152,7 +1263,7 @@ async function runLocalMethod(ctx, pending, methodKey) {
     path.extname(pending.inputPath) || '.mp4'
   );
 
-  const status = await ctx.reply('⚙️ Processing with Luna…');
+  const status = await statusReply(ctx, '⚙️ Processing with Luna…');
 
   try {
     const mod = loadMethod('c_method.js');
@@ -1264,9 +1375,47 @@ function alphaEstimate(meta, targetFps) {
   };
 }
 
+async function xoraRequest(route, options = {}) {
+  if (!XORA_API_KEY) {
+    throw new Error('Alpha is not configured yet. Please contact the bot administrator.');
+  }
+
+  const response = await fetch(
+    `${XORA_API}${route}`,
+    {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${XORA_API_KEY}`,
+        ...(options.headers || {})
+      },
+      signal: options.signal || AbortSignal.timeout(120000),
+    }
+  );
+
+  const raw = await response.text();
+  let data = {};
+
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    data = { message: raw.slice(0, 500) };
+  }
+
+  if (!response.ok) {
+    const detail =
+      data.error && (data.error.message || data.error.code) ||
+      data.message ||
+      data.detail ||
+      `HTTP ${response.status}`;
+
+    throw new Error(`Alpha request failed: ${detail}`);
+  }
+
+  return data;
+}
+
 async function createAlphaJob(
   inputPath,
-  outputPath,
   targetFps,
   estimate,
   onProgress
@@ -1287,136 +1436,141 @@ async function createAlphaJob(
   const inputUrl =
     `${PUBLIC_URL.replace(/\/$/, '')}/alpha-input/${token}`;
 
-  const payload = {
-    inputUrl,
-    presetId: ALPHA_PRESET_ID,
-    videoCodec: 'wmv2',
-    audioCodec: 'wmav2',
-    height: 1080,
-    videoBitrate: ALPHA_VIDEO_BITRATE,
-    audioBitrate: ALPHA_AUDIO_BITRATE,
-    durationSec: Number(estimate.outputDuration.toFixed(3)),
-  };
+  const outputName = `alpha_${Date.now()}.wmv`;
+  const args = [];
 
   if (targetFps) {
-    payload.itsScale = Number(estimate.scaleFactor.toFixed(10));
+    args.push('-itsscale', estimate.scaleFactor.toFixed(10));
   }
 
-  const headers = { 'Content-Type': 'application/json' };
-  if (ENCODING_API_KEY) headers.Authorization = `Bearer ${ENCODING_API_KEY}`;
+  args.push(
+    '-i', '{{input}}',
+    '-map', '0:v:0', '-map', '0:a?',
+    '-vf', 'scale=-2:1080:flags=lanczos',
+    '-c:v', 'wmv2', '-b:v', ALPHA_VIDEO_BITRATE,
+    '-maxrate', '28M', '-bufsize', '50M',
+    '-c:a', 'wmav2', '-b:a', ALPHA_AUDIO_BITRATE,
+    '-f', 'asf', '{{output}}'
+  );
+
+  const created = await xoraRequest(
+    '/jobs',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        mode: 'ffmpeg',
+        input_files: {
+          in_1: inputUrl
+        },
+        output_files: {
+          out_1: outputName
+        },
+        ffmpeg: {
+          args: args.map((arg) =>
+            arg === '{{input}}'
+              ? '{{in_1}}'
+              : arg === '{{output}}'
+                ? '{{out_1}}'
+                : arg
+          )
+        },
+        idempotencyKey: `alpha-${crypto.randomUUID()}`,
+      }),
+    }
+  );
+
+  const jobId = created.id || created.jobId;
+
+  if (!jobId) {
+    throw new Error('Alpha did not return a job ID.');
+  }
 
   const started = Date.now();
-  let ticker;
+  const terminal = new Set([
+    'completed',
+    'failed',
+    'rejected',
+    'cancelled'
+  ]);
 
-  try {
-    const response = await fetch(`${ENCODING_API_URL}/v1/encode`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(ALPHA_JOB_TIMEOUT_MS),
-    });
+  let job;
 
-    if (!response.ok) {
-      const raw = await response.text().catch(() => '');
-      let data = {};
-      try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
+  while (Date.now() - started < ALPHA_JOB_TIMEOUT_MS) {
+    await sleep(2500);
 
-      if (response.status === 429) {
-        throw new Error('Alpha is busy right now (queue is full). Please try again in a minute.');
-      }
-      if (response.status === 401) {
-        throw new Error('Alpha server rejected the API key. Check ENCODING_API_KEY.');
-      }
+    job = await xoraRequest(
+      `/jobs/${encodeURIComponent(jobId)}`,
+      { method: 'GET' }
+    );
 
-      let detail =
-        data.error || data.detail || data.message ||
-        raw.slice(0, 300) || `HTTP ${response.status}`;
-
-      if (Array.isArray(data.availablePresets)) {
-        detail += ` (server presets: ${data.availablePresets.join(', ')}; bot sent: ${ALPHA_PRESET_ID})`;
-      }
-
-      throw new Error(`Alpha request failed: ${detail}`);
-    }
-
-    const queueState = response.headers.get('x-queue-status');
-    const queuePos = Number(response.headers.get('x-queue-position') || 0);
-    const serverJobId = response.headers.get('x-encoding-job-id');
+    const pct = Number(job.progress);
+    const state = String(job.state || 'processing');
 
     onProgress(
-      queueState === 'wait' ? `Queued (position ${queuePos})` : 'Starting',
-      null
+      state,
+      Number.isFinite(pct)
+        ? Math.max(0, Math.min(100, Math.round(pct)))
+        : null
     );
 
-    // Real encoding progress: the server publishes FFmpeg's out_time for this
-    // job; poll it and show the percentage it reports.
-    let lastPct = null;
-    let lastState = queueState === 'wait' ? 'queued' : 'starting';
-    let polling = false;
-
-    const pollProgress = async () => {
-      if (polling || !serverJobId) return;
-      polling = true;
-      try {
-        const r = await fetch(
-          `${ENCODING_API_URL}/v1/progress/${encodeURIComponent(serverJobId)}`,
-          { headers: ENCODING_API_KEY ? { Authorization: `Bearer ${ENCODING_API_KEY}` } : {}, signal: AbortSignal.timeout(8000) }
-        );
-        if (r.ok) {
-          const d = await r.json();
-          if (Number.isFinite(Number(d.percent))) lastPct = Math.round(Number(d.percent));
-          if (d.state) lastState = d.state;
-        }
-      } catch (_) { /* keep last known value */ }
-      polling = false;
-
-      const secs = Math.round((Date.now() - started) / 1000);
-      const label = lastState === 'queued' ? 'Waiting in queue'
-        : lastState === 'done' ? 'Finishing'
-        : 'Encoding';
-      onProgress(`${label} • ${secs}s`, lastState === 'queued' ? null : lastPct);
-    };
-
-    ticker = setInterval(pollProgress, 3000);
-    ticker.unref?.();
-
-    if (!response.body) {
-      throw new Error('Alpha server returned an empty response.');
+    if (terminal.has(state)) {
+      break;
     }
-
-    let received = 0;
-    const limiter = new Transform({
-      transform(chunk, _enc, cb) {
-        received += chunk.length;
-        if (received > MAX_UPLOAD_BYTES) {
-          return cb(new Error('Alpha output is larger than the allowed upload size.'));
-        }
-        cb(null, chunk);
-      }
-    });
-
-    await pipeline(
-      Readable.fromWeb(response.body),
-      limiter,
-      fs.createWriteStream(outputPath)
-    );
-
-    if (received < 1024) {
-      throw new Error('Alpha server returned an empty or invalid video.');
-    }
-
-    return { jobId: response.headers.get('x-encoding-job-id'), bytes: received };
-  } catch (err) {
-    if (err && err.name === 'TimeoutError') {
-      throw new Error(
-        'Alpha processing timed out. Your original video is still available; try again later.'
-      );
-    }
-    throw err;
-  } finally {
-    if (ticker) clearInterval(ticker);
-    alphaInputTokens.delete(token);
   }
+
+  if (!job || !terminal.has(job.state)) {
+    throw new Error(
+      'Alpha processing timed out. Your original video is still available; try again later.'
+    );
+  }
+
+  alphaInputTokens.delete(token);
+
+  if (job.state !== 'completed') {
+    const detail =
+      job.error && (job.error.message || job.error.code) ||
+      job.message ||
+      job.state;
+
+    throw new Error(`Alpha processing ${job.state}: ${detail}`);
+  }
+
+  const firstOutput = Array.isArray(job.outputs)
+    ? job.outputs[0]
+    : (
+        job.outputs &&
+        (job.outputs.out_1 || Object.values(job.outputs)[0])
+      );
+
+  const namedOutput = job.output_files &&
+    (job.output_files.out_1 || Object.values(job.output_files)[0]);
+
+  const outputUrl =
+    (job.output && (job.output.signedUrl || job.output.url)) ||
+    (firstOutput && (
+      firstOutput.signedUrl ||
+      firstOutput.url ||
+      firstOutput.downloadUrl
+    )) ||
+    (typeof firstOutput === 'string' ? firstOutput : null) ||
+    (namedOutput && (
+      namedOutput.signedUrl ||
+      namedOutput.url ||
+      namedOutput.storage_url
+    )) ||
+    (typeof namedOutput === 'string' ? namedOutput : null);
+
+  if (!outputUrl) {
+    throw new Error('Alpha completed but did not return an output download URL.');
+  }
+
+  return {
+    outputUrl,
+    jobId
+  };
 }
 
 async function runAlpha(ctx, pending, targetFps) {
@@ -1425,7 +1579,7 @@ async function runAlpha(ctx, pending, targetFps) {
   const meta = await inspectMedia(pending.inputPath);
   const estimate = alphaEstimate(meta, targetFps);
 
-  const status = await ctx.reply(
+  const status = await statusReply(ctx,
     '⚡ Alpha\nPreparing your video…'
   );
 
@@ -1435,19 +1589,12 @@ async function runAlpha(ctx, pending, targetFps) {
     await editProgress(
       ctx,
       status.message_id,
-      '⚡ Alpha\nSending to encoding server…',
+      '⚡ Alpha\nUploading video…',
       true
     );
 
-    outputPath = tempPath(
-      ctx.from.id,
-      'alpha_result',
-      '.wmv'
-    );
-
-    await createAlphaJob(
+    const result = await createAlphaJob(
       pending.inputPath,
-      outputPath,
       targetFps,
       estimate,
       (stage, percent) => {
@@ -1457,6 +1604,25 @@ async function runAlpha(ctx, pending, targetFps) {
           `⚡ Alpha\nStage: ${stage}${percent === null ? '' : `\nProgress: ${percent}%`}\nEstimated output: ${fmtTime(estimate.outputDuration)}`
         ).catch(() => {});
       }
+    );
+
+    outputPath = tempPath(
+      ctx.from.id,
+      'alpha_result',
+      '.wmv'
+    );
+
+    await editProgress(
+      ctx,
+      status.message_id,
+      '⚡ Alpha\nDownloading finished video…',
+      true
+    );
+
+    await downloadToFile(
+      result.outputUrl,
+      outputPath,
+      MAX_UPLOAD_BYTES
     );
 
     await editProgress(
@@ -1664,7 +1830,7 @@ bot.on(['video', 'document'], async (ctx) => {
     );
   }
 
-  const status = await ctx.reply('📥 Downloading your video…');
+  const status = await statusReply(ctx, '📥 Downloading your video…');
   let inputPath;
 
   try {
@@ -1704,6 +1870,8 @@ bot.on(['video', 'document'], async (ctx) => {
       undefined,
       `❌ Download failed: ${scrub(err.message)}`
     ).catch(() => {});
+  } finally {
+    releaseCtxActions(ctx);
   }
 });
 
@@ -1785,6 +1953,11 @@ function withBusy(ctx, fn) {
   busyUsers.add(id);
   busyInfo.set(id, { action, at: Date.now() });
 
+  // The menu message the user just tapped disappears at once (Telegram's own
+  // delete animation); progress is shown as a chat action in the header.
+  if (ctx.callbackQuery) ctx.deleteMessage().catch(() => {});
+  holdCtxAction(ctx, 'typing');
+
   (async () => {
     try {
       await fn();
@@ -1802,6 +1975,7 @@ function withBusy(ctx, fn) {
       }
 
     } finally {
+      releaseCtxActions(ctx);
       busyUsers.delete(id);
       busyInfo.delete(id);
     }
@@ -2206,7 +2380,7 @@ async function sendTikTokPreview(ctx, d, label) {
 }
 
 async function tiktokDeliver(ctx, d, { title, kind, caption, getUrl }) {
-  const status = await ctx.reply(`⏳ ${title}…`);
+  const status = await statusReply(ctx, `⏳ ${title}…`);
   const setStatus = (text) => ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, text).catch(() => {});
   let outputPath;
 
@@ -2220,7 +2394,12 @@ async function tiktokDeliver(ctx, d, { title, kind, caption, getUrl }) {
 
     if (kind === 'audio') {
       const sound = d.sound || {};
-      await ctx.replyWithAudio({ source: outputPath }, { title: sound.title || 'TikTok sound', performer: sound.artist || undefined, caption });
+      const releaseAudio = holdChatAction(ctx.chat.id, 'upload_voice');
+      try {
+        await ctx.replyWithAudio({ source: outputPath }, { title: sound.title || 'TikTok sound', performer: sound.artist || undefined, caption });
+      } finally {
+        releaseAudio();
+      }
     } else {
       await sendVideoFile(ctx, outputPath, caption);
     }
@@ -2283,7 +2462,7 @@ ttAction('original', (ctx, d, url) => tiktokDeliver(ctx, d, {
 }));
 
 ttAction('check', async (ctx, d, url) => {
-  const status = await ctx.reply('🔎 Checking video details…');
+  const status = await statusReply(ctx, '🔎 Checking video details…');
   try {
     const result = await requestTikTokBackend('analyze', url, { quality: 'standard' });
     // The standard video is attached as a link preview above the text (like a video card).
@@ -2294,6 +2473,8 @@ ttAction('check', async (ctx, d, url) => {
     });
   } catch (err) {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined, `❌ Check failed\n${scrub(err && err.message || err).slice(0, 900)}`).catch(() => {});
+  } finally {
+    releaseCtxActions(ctx);
   }
 });
 
@@ -2302,7 +2483,7 @@ bot.on('text', async (ctx) => {
   const link = found && found[0];
   if (!link || !validTikTokUrl(link)) return;
 
-  const status = await ctx.reply('🔎 Fetching video…');
+  const status = await statusReply(ctx, '🔎 Fetching video…');
   try {
     const d = (await requestTikTokBackend('check', link)).data || {};
     if (!d.video || !d.video.id) throw new Error('Could not read the video ID from this link.');
@@ -2315,6 +2496,8 @@ bot.on('text', async (ctx) => {
     console.error('[tiktok-backend]', scrub(err && err.stack || err));
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, undefined,
       `❌ TikTok check failed.\n\n${scrub(err && err.message || 'Backend request failed.').slice(0, 1200)}`).catch(() => {});
+  } finally {
+    releaseCtxActions(ctx);
   }
 });
 
