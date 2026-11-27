@@ -5,7 +5,7 @@
 - **HD Method**: Luna (the original MP4Patcher adapter) or Jarvis HQ (`POST /upload/`).
 - **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
 - **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
-- **Alpha**: replaces the old FFmpeg menu option. It creates a 720p WMV2/WMAV2 output at 18 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
+- **Alpha**: replaces the old FFmpeg menu option. It creates a 1080p WMV2/WMAV2 output at 25 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
 - **Checker & Downloader**: TikTok URLs are sent to the Netlify backend. The bot shows metadata, provides an Original Download button that submits/polls the existing TikWM original task and sends the resulting MP4 directly into Telegram, and runs FFprobe only when Check Details is tapped. Browser Playback quality buttons are not enabled until the Kuronai Browser Playback resolver source/API is supplied; the TikWM HTML explicitly does not expose those browser streams.
 
 ## Deploy
@@ -27,7 +27,7 @@
 
 ## Alpha setup
 - Add `XORA_API_KEY` in Render Environment. The bot sends the Telegram upload to a short-lived, random HTTPS endpoint on this service, submits a custom FFmpeg job, polls until it finishes, downloads the WMV output, and sends it back.
-- Alpha uses WMV2 video, WMAV2 audio, 720p scaling, and an 18 Mbps default video bitrate (configurable from 15M to 20M). FPS patching uses the source FPS divided by the selected target FPS as the `-itsscale` factor. The estimate shown is approximate; actual size varies with encoder output.
+- Alpha uses WMV2 video, WMAV2 audio, 1080p scaling, and a 25 Mbps default video bitrate. FPS patching uses the source FPS divided by the selected target FPS as the `-itsscale` factor. The estimate shown is approximate; actual size varies with encoder output.
 
 ## Telegram delivery (v2.1 fix)
 - **Upload path:** processed videos are sent to the Bot API with Node's native `fetch` + `FormData`. This is a normal `Content-Length` upload (what `curl -F video=@file.mp4` sends) instead of Telegraf's chunked stream, which Telegram was dropping with `socket hang up`. Up to 4 attempts with backoff (honours Telegram's `retry_after`), then the unchanged MP4 is sent as a document.

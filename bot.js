@@ -2303,6 +2303,29 @@ async function probeStandardQuality(url, timeoutMs = 10000) {
   return qualityLabel({ width: st.width, height: st.height, fps, size });
 }
 
+async function resolveStandardLabel(d) {
+  const dl = d.downloads || {};
+  const v = d.video || {};
+  const urls = [dl.video, dl.hd].filter((u, i, a) => u && a.indexOf(u) === i);
+
+  for (const url of urls) {
+    try {
+      const label = await probeStandardQuality(url, 15000);
+      if (label) return label;
+    } catch (err) {
+      console.warn('[tiktok] Quality probe failed:', scrub(err && err.message || err));
+    }
+  }
+
+  // Fall back to whatever the backend reported about the standard video.
+  return qualityLabel({
+    width: v.width || v.w,
+    height: v.height || v.h,
+    fps: Number(v.fps || v.frame_rate || v.framerate),
+    size: v.size
+  });
+}
+
 function tiktokCaption(d) {
   const a = d.author || {}, v = d.video || {};
   const head = [
@@ -2331,7 +2354,7 @@ function ttUrl(id, user) {
 function tiktokKeyboard(d, label) {
   const size = mbText(d.video && d.video.size);
   const rows = [
-    [Markup.button.callback(label || `⬇️ Standard download${size ? ' • ' + size : ''}`, ttData('std', d))],
+    [Markup.button.callback(label || `⬇️ ${size || 'Video'}`, ttData('std', d))],
     [
       Markup.button.callback('⚡ Original', ttData('original', d)),
       Markup.button.callback('🎵 MP3', ttData('mp3', d)),
@@ -2420,7 +2443,7 @@ function ttAction(action, work) {
 }
 
 ttAction('std', (ctx, d) => tiktokDeliver(ctx, d, {
-  title: 'Standard download', kind: 'video', caption: '✅ Standard quality',
+  title: 'Standard video', kind: 'video', caption: '✅ Standard quality',
   getUrl: async () => d.downloads && (d.downloads.video || d.downloads.hd)
 }));
 
@@ -2473,9 +2496,7 @@ bot.on('text', async (ctx) => {
   try {
     const d = (await requestTikTokBackend('check', link)).data || {};
     if (!d.video || !d.video.id) throw new Error('Could not read the video ID from this link.');
-    let label = null;
-    try { label = await probeStandardQuality(d.downloads && (d.downloads.video || d.downloads.hd)); }
-    catch (err) { console.warn('[tiktok] Local quality probe failed:', scrub(err && err.message || err)); }
+    const label = await resolveStandardLabel(d);
     await sendTikTokPreview(ctx, d, label);
     await ctx.telegram.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
   } catch (err) {
