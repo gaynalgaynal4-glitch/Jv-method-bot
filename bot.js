@@ -2303,21 +2303,90 @@ async function probeStandardQuality(url, timeoutMs = 10000) {
   return qualityLabel({ width: st.width, height: st.height, fps, size });
 }
 
-async function resolveStandardLabel(d) {
+const hasResolution = (label) => /\d+p\b/.test(String(label || ''));
+
+// Fallback that does not depend on FFprobe's own network/TLS support: download the first
+// ~3 MB of the file with fetch (MP4 headers sit at the start), then probe the local copy.
+async function probeByRangeDownload(url) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Referer': 'https://www.tikwm.com/',
+    'Range': 'bytes=0-3145727'
+  };
+  const res = await fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(20000) });
+  if (!res.ok && res.status !== 206) throw new Error(`Video download HTTP ${res.status}`);
+
+  let total = 0;
+  const range = res.headers.get('content-range');
+  if (range && /\/(\d+)$/.test(range)) total = Number(RegExp.$1);
+  else total = Number(res.headers.get('content-length')) || 0;
+
+  const buf = Buffer.from(await res.arrayBuffer()).subarray(0, 3145728);
+  const file = path.join(os.tmpdir(), `ttprobe_${crypto.randomBytes(6).toString('hex')}.mp4`);
+  await fs.promises.writeFile(file, buf);
+
+  try {
+    const probe = await new Promise((resolve, reject) => {
+      execFile(FFPROBE, ['-v', 'error', '-select_streams', 'v:0',
+        '-show_entries', 'stream=width,height,avg_frame_rate,r_frame_rate', '-of', 'json', file],
+        { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+          if (err) return reject(err);
+          try { resolve(JSON.parse(stdout)); } catch (e) { reject(e); }
+        });
+    });
+    const st = (probe.streams || [])[0] || {};
+    let fps = parseFps(st.avg_frame_rate);
+    if (!Number.isFinite(fps) || fps <= 0) fps = parseFps(st.r_frame_rate);
+    return qualityLabel({ width: st.width, height: st.height, fps, size: total });
+  } finally {
+    fs.promises.unlink(file).catch(() => {});
+  }
+}
+
+async function resolveStandardLabel(d, link) {
   const dl = d.downloads || {};
   const v = d.video || {};
-  const urls = [dl.video, dl.hd].filter((u, i, a) => u && a.indexOf(u) === i);
+  const abs = (u) => (u && u.startsWith('/') ? 'https://www.tikwm.com' + u : u);
+  const urls = [dl.video, dl.hd].map(abs).filter((u, i, a) => u && a.indexOf(u) === i);
 
   for (const url of urls) {
+    // 1) FFprobe straight on the URL.
     try {
       const label = await probeStandardQuality(url, 15000);
-      if (label) return label;
+      if (hasResolution(label)) return label;
+      console.warn('[tiktok] FFprobe on URL returned no resolution:', label);
     } catch (err) {
-      console.warn('[tiktok] Quality probe failed:', scrub(err && err.message || err));
+      console.warn('[tiktok] FFprobe on URL failed:', scrub(err && err.message || err));
+    }
+    // 2) Download the file head ourselves, then FFprobe the local copy.
+    try {
+      const label = await probeByRangeDownload(url);
+      if (hasResolution(label)) return label;
+      console.warn('[tiktok] Range probe returned no resolution:', label);
+    } catch (err) {
+      console.warn('[tiktok] Range probe failed:', scrub(err && err.message || err));
     }
   }
 
-  // Fall back to whatever the backend reported about the standard video.
+  // 3) Ask the backend to probe the exact Standard file.
+  if (link) {
+    try {
+      const r = await requestTikTokBackend('analyze', link, { quality: 'standard' });
+      const m = r.media || {};
+      const label = qualityLabel({
+        width: m.width,
+        height: m.height,
+        fps: Number(m.fps),
+        size: m.file_size || v.size
+      });
+      if (hasResolution(label)) return label;
+      console.warn('[tiktok] Backend analyze returned no resolution:', JSON.stringify(m).slice(0, 200));
+    } catch (err) {
+      console.warn('[tiktok] Backend quality probe failed:', scrub(err && err.message || err));
+    }
+  }
+
+  // Last resort: whatever the backend reported about the standard video (size only).
   return qualityLabel({
     width: v.width || v.w,
     height: v.height || v.h,
@@ -2496,7 +2565,7 @@ bot.on('text', async (ctx) => {
   try {
     const d = (await requestTikTokBackend('check', link)).data || {};
     if (!d.video || !d.video.id) throw new Error('Could not read the video ID from this link.');
-    const label = await resolveStandardLabel(d);
+    const label = await resolveStandardLabel(d, link);
     await sendTikTokPreview(ctx, d, label);
     await ctx.telegram.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
   } catch (err) {
