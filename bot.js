@@ -451,6 +451,11 @@ Telegram.prototype.deleteMessage = function (chatId, messageId) {
   return _tgDeleteMessage.call(this, chatId, messageId);
 };
 
+async function removeStatus(ctx, status) {
+  if (!status || !status.message_id) return;
+  await ctx.telegram.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
+}
+
 async function editProgress(ctx, messageId, text, force = false) {
   const now = Date.now();
 
@@ -1105,7 +1110,7 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   const title = enhanced ? 'Enhanced Method' : 'Jarvis';
   const started = Date.now();
 
-  const status = await statusReply(ctx,
+  const status = await ctx.reply(
     `⚙️ ${title}\nPreparing upload…\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON' : 'OFF')}\nServer encoding: waiting for server…\nElapsed: 00:00:00`
   );
 
@@ -1211,17 +1216,8 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
       `✅ ${title} complete\nOptimizer: ${enhanced ? 'N/A' : (encodeVideo ? 'ON — re-encode requested' : 'OFF — re-encode disabled')}`
     );
 
-    const deliveryNote =
-      delivery.sentAs === 'document_fallback'
-        ? '\nDelivered as an MP4 document after Telegram video upload retries.'
-        : '';
-
-    await editProgress(
-      ctx,
-      status.message_id,
-      `✅ ${title} completed\nElapsed: ${fmtTime(Date.now() - started)}${deliveryNote}`,
-      true
-    );
+    // Video is released: the progress message disappears (Telegram delete animation).
+    await removeStatus(ctx, status);
 
     await removePendingVideo(ctx.from.id, pending);
 
@@ -1263,7 +1259,7 @@ async function runLocalMethod(ctx, pending, methodKey) {
     path.extname(pending.inputPath) || '.mp4'
   );
 
-  const status = await statusReply(ctx, '⚙️ Processing with Luna…');
+  const status = await ctx.reply('⚙️ Processing with Luna…');
 
   try {
     const mod = loadMethod('c_method.js');
@@ -1290,12 +1286,7 @@ async function runLocalMethod(ctx, pending, methodKey) {
       '✅ Luna MP4Patcher completed'
     );
 
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      undefined,
-      '✅ Processing complete.'
-    );
+    await removeStatus(ctx, status);
 
     await removePendingVideo(userId, pending);
 
@@ -1579,7 +1570,7 @@ async function runAlpha(ctx, pending, targetFps) {
   const meta = await inspectMedia(pending.inputPath);
   const estimate = alphaEstimate(meta, targetFps);
 
-  const status = await statusReply(ctx,
+  const status = await ctx.reply(
     '⚡ Alpha\nPreparing your video…'
   );
 
@@ -1641,12 +1632,7 @@ async function runAlpha(ctx, pending, targetFps) {
       caption
     );
 
-    await editProgress(
-      ctx,
-      status.message_id,
-      '✅ Alpha completed.',
-      true
-    );
+    await removeStatus(ctx, status);
 
     await removePendingVideo(ctx.from.id, pending);
 

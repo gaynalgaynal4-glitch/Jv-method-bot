@@ -5,15 +5,15 @@
 - **HD Method**: Luna (the original MP4Patcher adapter) or Jarvis HQ (`POST /upload/`).
 - **Jarvis Optimizer ON/OFF**: maps to the extension's `encode_video=true/false` multipart field.
 - **Live Jarvis status**: displays elapsed time and server-reported NDJSON progress. If the server does not send a percentage, the bot displays a waiting/server-working status rather than inventing one.
-- **Alpha**: replaces the old FFmpeg menu option. It creates a 1080p WMV2/WMAV2 output at 25 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
+- **Alpha**: replaces the old FFmpeg menu option. It creates a 720p WMV2/WMAV2 output at 18 Mbps by default, with optional timestamp FPS patching to 30 or 60 FPS. It displays estimated output duration and size before starting a patched job.
 - **Checker & Downloader**: TikTok URLs are sent to the Netlify backend. The bot shows metadata, provides an Original Download button that submits/polls the existing TikWM original task and sends the resulting MP4 directly into Telegram, and runs FFprobe only when Check Details is tapped. Browser Playback quality buttons are not enabled until the Kuronai Browser Playback resolver source/API is supplied; the TikWM HTML explicitly does not expose those browser streams.
 
 ## Deploy
 1. Use Node.js 20 or newer.
 2. Set `BOT_TOKEN` to your Telegram bot token.
-3. Set `ENCODING_API_KEY` to the same value as `ENCODING_API_KEY` on your Netlify encoding server. Optional: `ENCODING_API_URL` (default `https://ffmpagserver.netlify.app`).
+3. Set `XORA_API_KEY` to your private API key.
 4. Set `RENDER_EXTERNAL_URL` (automatically provided by Render) or `PUBLIC_URL` to the public HTTPS service URL; Alpha exposes a short-lived, random input URL so the cloud processor can fetch the Telegram upload.
-5. Optional: set `ALPHA_VIDEO_BITRATE` (default `25M`, use `20M`–`30M`), `ALPHA_AUDIO_BITRATE` (default `128k`), `ALPHA_JOB_TIMEOUT_MS` (default 900000), `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, or `FFPROBE_PATH`.
+5. Optional: set `ALPHA_VIDEO_BITRATE` (default `25M`), `ALPHA_AUDIO_BITRATE` (default `128k`), `ALPHA_JOB_TIMEOUT_MS` (default 900000), `WEBHOOK_SECRET`, `PORT`, `MAX_VIDEO_MB`, or `FFPROBE_PATH`.
 6. Set `TIKTOK_API_URL` to your Netlify function URL, for example `https://YOUR-SITE.netlify.app/.netlify/functions/tiktok`, and set `TIKTOK_API_SECRET` to the same value as the backend's `API_SECRET`.
 7. Run `npm install` then `npm start`.
 8. Set `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`, and a long random `ADMIN_TOKEN` in Render Environment. These are required for persistent maintenance controls.
@@ -26,8 +26,8 @@
 - Keep `ADMIN_TOKEN` private. Use a long random value and do not commit your real `.env` file.
 
 ## Alpha setup
-- Add `ENCODING_API_KEY` in Render Environment. The bot exposes the Telegram upload at a short-lived, random HTTPS endpoint on this service and calls `POST /v1/encode` (preset `alpha-wmv-1080p`, WMV2 video + WMAV2 audio) on the Netlify encoding server. The server fetches the input, encodes it with FFmpeg, and streams the WMV back; the bot saves it and sends it to Telegram.
-- Alpha uses WMV2 video, WMAV2 audio, 1080p scaling, and an 25 Mbps default video bitrate (configurable from 20M to 30M). FPS patching uses the source FPS divided by the selected target FPS as the `-itsscale` factor. The estimate shown is approximate; actual size varies with encoder output.
+- Add `XORA_API_KEY` in Render Environment. The bot sends the Telegram upload to a short-lived, random HTTPS endpoint on this service, submits a custom FFmpeg job, polls until it finishes, downloads the WMV output, and sends it back.
+- Alpha uses WMV2 video, WMAV2 audio, 720p scaling, and an 18 Mbps default video bitrate (configurable from 15M to 20M). FPS patching uses the source FPS divided by the selected target FPS as the `-itsscale` factor. The estimate shown is approximate; actual size varies with encoder output.
 
 ## Telegram delivery (v2.1 fix)
 - **Upload path:** processed videos are sent to the Bot API with Node's native `fetch` + `FormData`. This is a normal `Content-Length` upload (what `curl -F video=@file.mp4` sends) instead of Telegraf's chunked stream, which Telegram was dropping with `socket hang up`. Up to 4 attempts with backoff (honours Telegram's `retry_after`), then the unchanged MP4 is sent as a document.
