@@ -264,7 +264,7 @@ async function patchEncoded(inputPath, outputPath, onProgress) {
   await downloadResponse(response, outputPath, onProgress);
 }
 
-async function process(inputPath, outputPath, optimizer = false, onProgress) {
+async function processVideo(inputPath, outputPath, optimizer = false, onProgress) {
   if (!API_KEY) throw new Error('TikQuick API key is missing. Add TIKQUICK_API_KEY to your hosting environment.');
   await checkLunaFps(inputPath);
   const size = fs.statSync(inputPath).size;
@@ -275,4 +275,4 @@ async function process(inputPath, outputPath, optimizer = false, onProgress) {
   return { optimizer: Boolean(optimizer), size: fs.statSync(outputPath).size };
 }
 
-module.exports = { process };
+module.exports = { process: processVideo };
