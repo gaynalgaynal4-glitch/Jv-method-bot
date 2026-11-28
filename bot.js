@@ -39,8 +39,8 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const UPSTASH_REDIS_REST_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const UPSTASH_REDIS_REST_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const MAINTENANCE_KEY = 'jv-methods:maintenance:v1';
-const METHOD_KEYS = ['enhanced', 'jarvis', 'luna', 'alpha'];
-const DEFAULT_MAINTENANCE = { enhanced: false, jarvis: false, luna: false, alpha: false };
+const METHOD_KEYS = ['enhanced', 'jarvis', 'luna', 'alpha', 'fps_patch'];
+const DEFAULT_MAINTENANCE = { enhanced: false, jarvis: false, luna: false, alpha: false, fps_patch: false };
 
 async function redisCommand(command) {
   if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
@@ -302,18 +302,14 @@ const METHODS = {
     label: '⚠️ Jarvis'
   },
   alpha: {
-    label: '⚡ Alpha'
+    label: '⚡ Alfa · TikQuick'
+  },
+  fps_patch: {
+    label: '🎞 FFmpeg FPS Patch'
   },
 };
 
-const XORA_API = 'https://api.xora.sh/v1';
-const XORA_API_KEY = process.env.XORA_API_KEY || '';
-const ALPHA_VIDEO_BITRATE = process.env.ALPHA_VIDEO_BITRATE || '25M';
-const ALPHA_AUDIO_BITRATE = process.env.ALPHA_AUDIO_BITRATE || '128k';
-const ALPHA_JOB_TIMEOUT_MS =
-  Number(process.env.ALPHA_JOB_TIMEOUT_MS || 15 * 60 * 1000);
-
-const alphaInputTokens = new Map();
+// TikQuick Alfa is called directly by the bot. No Netlify proxy or Xora job server.
 
 function userDir(userId) {
   const dir = path.join(WORK_DIR, String(userId));
@@ -1309,337 +1305,99 @@ function parseFps(value) {
     : NaN;
 }
 
-function alphaEstimate(meta, targetFps) {
-  const stream = (meta.streams || [])[0];
-
-  if (!stream) {
-    throw new Error('No video stream was found in this file.');
-  }
-
-  const sourceFps =
-    parseFps(stream.avg_frame_rate) ||
-    parseFps(stream.r_frame_rate);
-
-  const duration = Number(meta.format && meta.format.duration);
-
-  if (!Number.isFinite(sourceFps) || sourceFps <= 0) {
-    throw new Error('Could not detect the source FPS.');
-  }
-
-  if (!Number.isFinite(duration) || duration <= 0) {
-    throw new Error('Could not detect the video duration.');
-  }
-
-  const scaleFactor = targetFps ? sourceFps / targetFps : 1;
-  const outputDuration = duration * scaleFactor;
-
-  const videoBps =
-    Number(String(ALPHA_VIDEO_BITRATE)
-      .replace(/k$/i, '000')
-      .replace(/m$/i, '000000')) || 25000000;
-
-  const audioBps =
-    Number(String(ALPHA_AUDIO_BITRATE)
-      .replace(/k$/i, '000')
-      .replace(/m$/i, '000000')) || 128000;
-
-  const estimatedMB =
-    ((videoBps + audioBps) * outputDuration / 8) / 1048576;
-
-  return {
-    sourceFps,
-    duration,
-    scaleFactor,
-    outputDuration,
-    estimatedMB
-  };
-}
-
-async function xoraRequest(route, options = {}) {
-  if (!XORA_API_KEY) {
-    throw new Error('Alpha is not configured yet. Please contact the bot administrator.');
-  }
-
-  const response = await fetch(
-    `${XORA_API}${route}`,
-    {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${XORA_API_KEY}`,
-        ...(options.headers || {})
-      },
-      signal: options.signal || AbortSignal.timeout(120000),
-    }
-  );
-
-  const raw = await response.text();
-  let data = {};
-
-  try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch (_) {
-    data = { message: raw.slice(0, 500) };
-  }
-
-  if (!response.ok) {
-    const detail =
-      data.error && (data.error.message || data.error.code) ||
-      data.message ||
-      data.detail ||
-      `HTTP ${response.status}`;
-
-    throw new Error(`Alpha request failed: ${detail}`);
-  }
-
-  return data;
-}
-
-async function createAlphaJob(
-  inputPath,
-  targetFps,
-  estimate,
-  onProgress
-) {
-  if (!PUBLIC_URL || !/^https:\/\//i.test(PUBLIC_URL)) {
-    throw new Error(
-      'Alpha needs RENDER_EXTERNAL_URL or PUBLIC_URL set to this bot’s public HTTPS address.'
-    );
-  }
-
-  const token = crypto.randomBytes(24).toString('hex');
-
-  alphaInputTokens.set(token, {
-    path: inputPath,
-    expiresAt: Date.now() + 60 * 60 * 1000
-  });
-
-  const inputUrl =
-    `${PUBLIC_URL.replace(/\/$/, '')}/alpha-input/${token}`;
-
-  const outputName = `alpha_${Date.now()}.wmv`;
-  const args = [];
-
-  if (targetFps) {
-    args.push('-itsscale', estimate.scaleFactor.toFixed(10));
-  }
-
-  args.push(
-    '-i', '{{input}}',
-    '-map', '0:v:0', '-map', '0:a?',
-    '-vf', 'scale=-2:1080:flags=lanczos',
-    '-c:v', 'wmv2', '-b:v', ALPHA_VIDEO_BITRATE,
-    '-maxrate', '28M', '-bufsize', '50M',
-    '-c:a', 'wmav2', '-b:a', ALPHA_AUDIO_BITRATE,
-    '-f', 'asf', '{{output}}'
-  );
-
-  const created = await xoraRequest(
-    '/jobs',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        mode: 'ffmpeg',
-        input_files: {
-          in_1: inputUrl
-        },
-        output_files: {
-          out_1: outputName
-        },
-        ffmpeg: {
-          args: args.map((arg) =>
-            arg === '{{input}}'
-              ? '{{in_1}}'
-              : arg === '{{output}}'
-                ? '{{out_1}}'
-                : arg
-          )
-        },
-        idempotencyKey: `alpha-${crypto.randomUUID()}`,
-      }),
-    }
-  );
-
-  const jobId = created.id || created.jobId;
-
-  if (!jobId) {
-    throw new Error('Alpha did not return a job ID.');
-  }
-
-  const started = Date.now();
-  const terminal = new Set([
-    'completed',
-    'failed',
-    'rejected',
-    'cancelled'
-  ]);
-
-  let job;
-
-  while (Date.now() - started < ALPHA_JOB_TIMEOUT_MS) {
-    await sleep(2500);
-
-    job = await xoraRequest(
-      `/jobs/${encodeURIComponent(jobId)}`,
-      { method: 'GET' }
-    );
-
-    const pct = Number(job.progress);
-    const state = String(job.state || 'processing');
-
-    onProgress(
-      state,
-      Number.isFinite(pct)
-        ? Math.max(0, Math.min(100, Math.round(pct)))
-        : null
-    );
-
-    if (terminal.has(state)) {
-      break;
-    }
-  }
-
-  if (!job || !terminal.has(job.state)) {
-    throw new Error(
-      'Alpha processing timed out. Your original video is still available; try again later.'
-    );
-  }
-
-  alphaInputTokens.delete(token);
-
-  if (job.state !== 'completed') {
-    const detail =
-      job.error && (job.error.message || job.error.code) ||
-      job.message ||
-      job.state;
-
-    throw new Error(`Alpha processing ${job.state}: ${detail}`);
-  }
-
-  const firstOutput = Array.isArray(job.outputs)
-    ? job.outputs[0]
-    : (
-        job.outputs &&
-        (job.outputs.out_1 || Object.values(job.outputs)[0])
-      );
-
-  const namedOutput = job.output_files &&
-    (job.output_files.out_1 || Object.values(job.output_files)[0]);
-
-  const outputUrl =
-    (job.output && (job.output.signedUrl || job.output.url)) ||
-    (firstOutput && (
-      firstOutput.signedUrl ||
-      firstOutput.url ||
-      firstOutput.downloadUrl
-    )) ||
-    (typeof firstOutput === 'string' ? firstOutput : null) ||
-    (namedOutput && (
-      namedOutput.signedUrl ||
-      namedOutput.url ||
-      namedOutput.storage_url
-    )) ||
-    (typeof namedOutput === 'string' ? namedOutput : null);
-
-  if (!outputUrl) {
-    throw new Error('Alpha completed but did not return an output download URL.');
-  }
-
-  return {
-    outputUrl,
-    jobId
-  };
-}
-
-async function runAlpha(ctx, pending, targetFps) {
+async function runAlpha(ctx, pending) {
   const maintenance = await getMaintenance();
-  if (maintenance.alpha) throw new Error('Alpha is currently under maintenance.');
-  const meta = await inspectMedia(pending.inputPath);
-  const estimate = alphaEstimate(meta, targetFps);
+  if (maintenance.alpha) throw new Error('Alfa is currently under maintenance.');
 
-  const status = await ctx.reply(
-    '⚡ Alpha\nPreparing your video…'
-  );
-
-  let outputPath;
+  const status = await ctx.reply('⚡ Alfa · TikQuick\nPreparing your video…');
+  const outputPath = tempPath(ctx.from.id, 'alfa_result', '.mp4');
 
   try {
-    await editProgress(
-      ctx,
-      status.message_id,
-      '⚡ Alpha\nUploading video…',
-      true
-    );
+    const mod = loadMethod('tikquick_alfa.js');
 
-    const result = await createAlphaJob(
-      pending.inputPath,
-      targetFps,
-      estimate,
-      (stage, percent) => {
-        editProgress(
-          ctx,
-          status.message_id,
-          `⚡ Alpha\nStage: ${stage}${percent === null ? '' : `\nProgress: ${percent}%`}\nEstimated output: ${fmtTime(estimate.outputDuration)}`
-        ).catch(() => {});
-      }
-    );
+    await mod.process(pending.inputPath, outputPath, (stage, percent) => {
+      const progress = percent === null || percent === undefined
+        ? ''
+        : `\nProgress: ${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+      editProgress(
+        ctx,
+        status.message_id,
+        `⚡ Alfa · TikQuick\nStage: ${stage}${progress}`
+      ).catch(() => {});
+    });
 
-    outputPath = tempPath(
-      ctx.from.id,
-      'alpha_result',
-      '.wmv'
-    );
-
-    await editProgress(
-      ctx,
-      status.message_id,
-      '⚡ Alpha\nDownloading finished video…',
-      true
-    );
-
-    await downloadToFile(
-      result.outputUrl,
-      outputPath,
-      MAX_UPLOAD_BYTES
-    );
-
-    await editProgress(
-      ctx,
-      status.message_id,
-      '📤 Sending your video…',
-      true
-    );
-
-    const caption =
-      `✅ Alpha completed\nOutput: 1080p WMV2\n${targetFps ? `FPS patch: ${targetFps} FPS\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\n` : 'FPS patch: Off\n'}Estimated duration: ${fmtTime(estimate.outputDuration)}\nEstimated size: ${estimate.estimatedMB.toFixed(1)} MB`;
+    await editProgress(ctx, status.message_id, '📤 Sending processed video…', true);
 
     await sendDocumentFile(
       ctx,
       outputPath,
-      caption
+      '✅ Alfa · TikQuick completed\nProcessed directly by TikQuick Alfa (alfa-v1).'
     );
 
     await removeStatus(ctx, status);
-
     await removePendingVideo(ctx.from.id, pending);
-
   } catch (err) {
     await editProgress(
       ctx,
       status.message_id,
-      `❌ Alpha failed\n${scrub(err.message || err).slice(0, 1000)}\n\nYour original video is still available.`,
+      `❌ Alfa failed\n${scrub(err.message || err).slice(0, 1000)}\n\nYour original video is still available.`,
+      true
+    );
+    err.__reported = true;
+    throw err;
+  } finally {
+    await fs.promises.unlink(outputPath).catch(() => {});
+  }
+}
+
+
+// Native FFmpeg ItScale: timestamp-scale every stream and stream-copy without re-encoding.
+async function runFfmpegFpsPatch(ctx, pending, targetFps) {
+  const maintenance = await getMaintenance();
+  if (maintenance.fps_patch) throw new Error('FFmpeg FPS Patch is currently under maintenance.');
+  if (![30, 60].includes(Number(targetFps))) throw new Error('Target FPS must be 30 or 60.');
+
+  const userId = ctx.from.id;
+  const outputPath = tempPath(userId, 'ffmpeg_fps_patch', '.mp4');
+  const status = await ctx.reply('🎞 FFmpeg FPS Patch\nReading source frame rate…');
+
+  try {
+    const mod = loadMethod('ffmpage_method.js');
+    const sourceFps = await mod.getSourceFps(pending.inputPath);
+    const scaleFactor = sourceFps / Number(targetFps);
+    const meta = await inspectMedia(pending.inputPath);
+    const inputDuration = Number(meta.format && meta.format.duration) || 0;
+    const outputDuration = inputDuration * scaleFactor;
+
+    await editProgress(
+      ctx,
+      status.message_id,
+      `🎞 FFmpeg FPS Patch\nInput: ${sourceFps.toFixed(3)} FPS\nReference: ${targetFps} FPS\nItScale: ${scaleFactor.toFixed(4)}x\nMode: -c copy · no re-encoding\nProcessing…`,
       true
     );
 
+    await mod.process(pending.inputPath, outputPath, { targetFps: Number(targetFps) });
+
+    await editProgress(ctx, status.message_id, '📤 Sending stream-copied video…', true);
+    await sendVideoFile(
+      ctx,
+      outputPath,
+      `✅ FFmpeg FPS Patch completed\nInput FPS: ${sourceFps.toFixed(3)}\nReference FPS: ${targetFps}\nItScale: ${scaleFactor.toFixed(4)}x\nDuration multiplier: ${scaleFactor.toFixed(4)}x\nEncoding: none (-c copy)`
+    );
+
+    await removeStatus(ctx, status);
+    await removePendingVideo(userId, pending);
+  } catch (err) {
+    await editProgress(
+      ctx,
+      status.message_id,
+      `❌ FFmpeg FPS Patch failed\n${scrub(err.message || err).slice(0, 1000)}\n\nYour original video is still available.`,
+      true
+    );
     err.__reported = true;
     throw err;
-
   } finally {
-    if (outputPath) {
-      await fs.promises.unlink(outputPath).catch(() => {});
-    }
+    await fs.promises.unlink(outputPath).catch(() => {});
   }
 }
 
@@ -1653,7 +1411,8 @@ function mainKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🟢 Enhanced', 'method:enhanced:info')],
     [Markup.button.callback('⚠️ HD Method', 'menu:hd')],
-    [Markup.button.callback('⚡ Alpha', 'menu:alpha')],
+    [Markup.button.callback('⚡ Alfa · TikQuick', 'menu:alpha')],
+    [Markup.button.callback('🎞 FFmpeg FPS Patch', 'menu:fpspatch')],
   ]);
 }
 
@@ -1691,37 +1450,16 @@ function methodInfoKeyboard(method) {
 
 function alphaConfirmKeyboard() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback('✅ Yes', 'alpha:confirm'),
-      Markup.button.callback('❌ No', 'menu:main')
-    ],
-  ]);
-}
-
-function alphaPatchKeyboard() {
-  return Markup.inlineKeyboard([
-    [
-      Markup.button.callback('✅ Yes', 'alpha:patch:yes'),
-      Markup.button.callback('❌ No', 'menu:main')
-    ],
+    [Markup.button.callback('🚀 Run TikQuick Alfa', 'alpha:start')],
     [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
-function alphaFpsKeyboard() {
+function fpsPatchKeyboard() {
   return Markup.inlineKeyboard([
-    [
-      Markup.button.callback('60 FPS', 'alpha:fps:60'),
-      Markup.button.callback('30 FPS', 'alpha:fps:30')
-    ],
-    [Markup.button.callback('⬅️ Back', 'alpha:confirm')],
-  ]);
-}
-
-function alphaStartKeyboard(fps) {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('🚀 Start Alpha', `alpha:start:${fps}`)],
-    [Markup.button.callback('⬅️ Back', 'alpha:patch:yes')],
+    [Markup.button.callback('60 FPS reference', 'fpspatch:run:60')],
+    [Markup.button.callback('30 FPS reference', 'fpspatch:run:30')],
+    [Markup.button.callback('⬅️ Back', 'menu:main')],
   ]);
 }
 
@@ -1893,10 +1631,27 @@ bot.action('menu:alpha', async (ctx) => {
   await ctx.answerCbQuery();
 
   const maintenance = await getMaintenance();
-  if (maintenance.alpha) return ctx.editMessageText('🛠 Alpha is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
+  if (maintenance.alpha) return ctx.editMessageText('🛠 Alfa is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
+  if (!process.env.TIKQUICK_API_KEY) return ctx.editMessageText(
+    '⚡ Alfa · TikQuick\\n\\nTikQuick API key is not configured. Please contact the administrator.',
+    Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]])
+  );
   return ctx.editMessageText(
-    'Alpha can give you up to 1080p 60fps or 30fps, depending on your choice. TikTok can still compress your video later, so HD Method is recommended.',
+    '⚡ Alfa · TikQuick\n\nYour video will be sent directly to TikQuick’s Alfa method (alfa-v1). No Netlify backend is used.',
     alphaConfirmKeyboard()
+  );
+});
+
+
+bot.action('menu:fpspatch', async (ctx) => {
+  await ctx.answerCbQuery();
+  const maintenance = await getMaintenance();
+  if (maintenance.fps_patch) {
+    return ctx.editMessageText('🛠 FFmpeg FPS Patch is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:main')]]));
+  }
+  return ctx.editMessageText(
+    '🎞 FFmpeg FPS Patch\n\nNative FFmpeg ItScale timestamp scaling. Example: 120 FPS → 60 FPS uses 2.0x. Uses -c copy, so streams are not re-encoded. Playback duration changes by the same scale factor.',
+    fpsPatchKeyboard()
   );
 });
 
@@ -2050,77 +1805,29 @@ bot.action(/^jarvis:run:(on|off)$/, async (ctx) => {
   });
 });
 
-bot.action('alpha:confirm', async (ctx) => {
+bot.action('alpha:start', async (ctx) => {
+  if ((await getMaintenance()).alpha) {
+    await ctx.answerCbQuery('Alfa is under maintenance.', { show_alert: true });
+    return;
+  }
   await ctx.answerCbQuery();
-  if ((await getMaintenance()).alpha) return ctx.reply('🛠 Alpha is currently under maintenance.');
-
-  return ctx.editMessageText(
-    '⚡ Alpha\n\nDo you want to patch FPS?',
-    alphaPatchKeyboard()
-  );
-});
-
-bot.action('alpha:patch:yes', async (ctx) => {
-  await ctx.answerCbQuery();
-
-  return ctx.editMessageText(
-    'Choose the target FPS:',
-    alphaFpsKeyboard()
-  );
-});
-
-bot.action('alpha:patch:no', async (ctx) => {
-  await ctx.answerCbQuery();
-
   return withBusy(ctx, async () => {
-    const p = await getPending(ctx);
-
-    if (p) {
-      await runAlpha(ctx, p, null);
-    }
+    const pending = await getPending(ctx);
+    if (pending) await runAlpha(ctx, pending);
   });
 });
 
-bot.action(/^alpha:fps:(30|60)$/, async (ctx) => {
-  const fps = Number(ctx.match[1]);
 
-  await ctx.answerCbQuery('Calculating estimate…');
-
-  const p = await getPending(ctx);
-
-  if (!p) return;
-
-  try {
-    const meta = await inspectMedia(p.inputPath);
-    const estimate = alphaEstimate(meta, fps);
-
-    const preview =
-      `⚡ Alpha\n\nSource FPS: ${estimate.sourceFps.toFixed(3)}\nTarget FPS: ${fps}\nTimestamp scale: ${estimate.scaleFactor.toFixed(4)}x\nEstimated output duration: ${fmtTime(estimate.outputDuration)}\nEstimated output size: ${estimate.estimatedMB.toFixed(1)} MB\nVideo bitrate: ${ALPHA_VIDEO_BITRATE}\n\nStart processing?`;
-
-    return ctx.editMessageText(
-      preview,
-      alphaStartKeyboard(fps)
-    );
-
-  } catch (err) {
-    return ctx.reply(
-      `❌ Could not estimate Alpha output: ${scrub(err.message)}`
-    );
+bot.action(/^fpspatch:run:(30|60)$/, async (ctx) => {
+  const targetFps = Number(ctx.match[1]);
+  if ((await getMaintenance()).fps_patch) {
+    await ctx.answerCbQuery('FFmpeg FPS Patch is under maintenance.', { show_alert: true });
+    return;
   }
-});
-
-bot.action(/^alpha:start:(30|60)$/, async (ctx) => {
-  const fps = Number(ctx.match[1]);
-  if ((await getMaintenance()).alpha) { await ctx.answerCbQuery('Alpha is under maintenance.', { show_alert: true }); return; }
-
   await ctx.answerCbQuery();
-
   return withBusy(ctx, async () => {
-    const p = await getPending(ctx);
-
-    if (p) {
-      await runAlpha(ctx, p, fps);
-    }
+    const pending = await getPending(ctx);
+    if (pending) await runFfmpegFpsPatch(ctx, pending, targetFps);
   });
 });
 
@@ -2627,7 +2334,7 @@ const maintenanceHtml = `<!doctype html>
 <body><div class="wrap"><h1>JV Methods — Maintenance</h1><p class="sub">Changes are saved to Upstash Redis and survive Render restarts and deployments.</p><div id="items"></div><div id="status">Loading settings…</div></div>
 <script>
 const token=new URLSearchParams(location.search).get('token')||'';
-const names={enhanced:'Enhanced Method',jarvis:'Jarvis',luna:'Luna',alpha:'Alpha'};
+const names={enhanced:'Enhanced Method',jarvis:'Jarvis',luna:'Luna',alpha:'Alfa · TikQuick',fps_patch:'FFmpeg FPS Patch'};
 async function api(method,body){const r=await fetch('/api/maintenance',{method,headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json().catch(function(){return {};});if(!r.ok)throw new Error(d.error||'Request failed');return d;}
 function draw(data){document.getElementById('items').innerHTML=Object.entries(names).map(function(e){var key=e[0],name=e[1],on=data[key]===true;return '<div class="item"><div><div class="name">'+name+'</div><div class="state">'+(on?'Under maintenance':'Available')+'</div></div><button data-key="'+key+'" data-enabled="'+(!on)+'" class="'+(on?'on':'')+'">'+(on?'Turn OFF':'Turn ON')+'</button></div>';}).join('');}
 document.getElementById('items').addEventListener('click',function(ev){var b=ev.target.closest('button[data-key]');if(b)toggle(b.dataset.key,b.dataset.enabled==='true');});
@@ -2661,41 +2368,6 @@ app.get('/', (_req, res) => {
     status: 'ok',
     service: 'JV Methods Bot'
   });
-});
-
-// Expire old Alpha input URLs
-setInterval(() => {
-  for (const [token, entry] of alphaInputTokens) {
-    if (entry.expiresAt < Date.now()) {
-      alphaInputTokens.delete(token);
-    }
-  }
-}, 10 * 60 * 1000).unref();
-
-// Alpha input download route
-app.get('/alpha-input/:token', (req, res) => {
-  const entry = alphaInputTokens.get(req.params.token);
-
-  if (
-    !entry ||
-    entry.expiresAt < Date.now() ||
-    !fs.existsSync(entry.path)
-  ) {
-    alphaInputTokens.delete(req.params.token);
-    return res.status(404).end('Not found');
-  }
-
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Content-Type', 'application/octet-stream');
-
-  return res.sendFile(
-    entry.path,
-    (err) => {
-      if (err && !res.headersSent) {
-        res.status(500).end('File unavailable');
-      }
-    }
-  );
 });
 
 app.use(bot.webhookCallback(WEBHOOK_PATH));
