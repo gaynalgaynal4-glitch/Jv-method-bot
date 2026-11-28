@@ -1248,59 +1248,48 @@ async function runKuronai(ctx, pending, mode, encodeVideo) {
   }
 }
 
-async function runLocalMethod(ctx, pending, methodKey) {
+async function runTikQuickLuna(ctx, pending, optimizer) {
   const maintenance = await getMaintenance();
-  if (maintenance[methodKey]) throw new Error('Luna is currently under maintenance.');
+  if (maintenance.luna) throw new Error('Luna is currently under maintenance.');
   const userId = ctx.from.id;
-
-  const outputPath = tempPath(
-    userId,
-    `out_${methodKey}`,
-    path.extname(pending.inputPath) || '.mp4'
+  const outputPath = tempPath(userId, 'tikquick_luna', '.mp4');
+  const status = await ctx.reply(
+    `🌙 Luna · TikQuick\nOptimizer: ${optimizer ? 'ON — VAPI/VAPI2 encoding + patch' : 'OFF — direct patch'}\nPreparing…`
   );
-
-  const status = await ctx.reply('⚙️ Processing with Luna…');
+  const started = Date.now();
+  let lastUpdate = 0;
 
   try {
-    const mod = loadMethod('c_method.js');
+    const mod = loadMethod('tikquick_luna.js');
+    await mod.process(pending.inputPath, outputPath, optimizer, (stage, percent) => {
+      const now = Date.now();
+      if (now - lastUpdate < 1200 && percent !== 100) return;
+      lastUpdate = now;
+      const progress = percent === null || percent === undefined ? '' : `\nProgress: ${Math.max(0, Math.min(100, Math.round(percent)))}%`;
+      editProgress(
+        ctx,
+        status.message_id,
+        `🌙 Luna · TikQuick\nOptimizer: ${optimizer ? 'ON' : 'OFF'}\nStage: ${String(stage).slice(0, 70)}${progress}\nElapsed: ${fmtTime(Date.now() - started)}`
+      ).catch(() => {});
+    });
 
-    await mod.process(pending.inputPath, outputPath);
-
-    if (
-      !fs.existsSync(outputPath) ||
-      fs.statSync(outputPath).size === 0
-    ) {
-      throw new Error('The method did not produce a valid output file.');
-    }
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      status.message_id,
-      undefined,
-      '📤 Uploading processed video…'
-    );
-
+    await editProgress(ctx, status.message_id, '📤 Sending patched video to Telegram…', true);
     await sendVideoFile(
       ctx,
       outputPath,
-      '✅ Luna MP4Patcher completed'
+      `✅ Luna completed with TikQuick\nOptimizer: ${optimizer ? 'ON — VAPI/VAPI2 encode + Luna patch' : 'OFF — direct Luna patch'}`
     );
-
     await removeStatus(ctx, status);
-
     await removePendingVideo(userId, pending);
-
   } catch (err) {
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
+    await editProgress(
+      ctx,
       status.message_id,
-      undefined,
-      `❌ Processing failed: ${scrub(err.message)}`
-    ).catch(() => {});
-
+      `❌ Luna · TikQuick failed\n${scrub(err.message || err).slice(0, 1000)}\n\nYour original video is still available.`,
+      true
+    );
     err.__reported = true;
     throw err;
-
   } finally {
     await fs.promises.unlink(outputPath).catch(() => {});
   }
@@ -1685,6 +1674,14 @@ function optimizerKeyboard() {
   ]);
 }
 
+function lunaOptimizerKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('🟢 Optimizer ON', 'luna:optimizer:on')],
+    [Markup.button.callback('⚪ Optimizer OFF', 'luna:optimizer:off')],
+    [Markup.button.callback('⬅️ Back', 'menu:hd')],
+  ]);
+}
+
 function methodInfoKeyboard(method) {
   return Markup.inlineKeyboard([
     [Markup.button.callback(method === 'luna' ? '🚀 Run Process' : '🚀 Continue', `method:${method}:run`)],
@@ -1993,16 +1990,39 @@ bot.action('method:luna:info', async (ctx) => {
   await ctx.answerCbQuery();
   const maintenance = await getMaintenance();
   if (maintenance.luna) return ctx.editMessageText('🛠 Luna is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]]));
-  return ctx.editMessageText('Luna', methodInfoKeyboard('luna'));
+  if (!process.env.TIKQUICK_API_KEY) {
+    return ctx.editMessageText(
+      '🌙 Luna · TikQuick\\n\\nTikQuick API key is not configured. Please contact the administrator.',
+      Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]])
+    );
+  }
+  return ctx.editMessageText(
+    '🌙 Luna · TikQuick\\n\\nChoose whether to optimize before patching.\\n\\nOptimizer ON: encode with the least-busy VAPI/VAPI2 server, then patch with Luna.\\nOptimizer OFF: upload the original video directly for Luna patching.',
+    lunaOptimizerKeyboard()
+  );
 });
 
-bot.action('method:luna:run', async (ctx) => {
+bot.action(/^luna:optimizer:(on|off)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const maintenance = await getMaintenance();
+  if (maintenance.luna) return ctx.editMessageText('🛠 Luna is currently under maintenance.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'menu:hd')]]));
+  const enabled = ctx.match[1] === 'on';
+  return ctx.editMessageText(
+    `🌙 Luna selected\\nOptimizer: ${enabled ? 'ON — VAPI/VAPI2 encode, then patch' : 'OFF — direct patch, no encoder'}`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🚀 Run Luna', `luna:run:${enabled ? 'on' : 'off'}`)],
+      [Markup.button.callback('⬅️ Back', 'method:luna:info')]
+    ])
+  );
+});
+
+bot.action(/^luna:run:(on|off)$/, async (ctx) => {
   await ctx.answerCbQuery();
   return withBusy(ctx, async () => {
     const maintenance = await getMaintenance();
     if (maintenance.luna) return ctx.reply('🛠 Luna is currently under maintenance.');
     const p = await getPending(ctx);
-    if (p) await runLocalMethod(ctx, p, 'luna');
+    if (p) await runTikQuickLuna(ctx, p, ctx.match[1] === 'on');
   });
 });
 
